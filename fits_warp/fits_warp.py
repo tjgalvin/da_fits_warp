@@ -86,6 +86,8 @@ def make_pix_models(
     hdr = fits.getheader(fitsname)
     imwcs = wcs.WCS(hdr, naxis=2)
 
+    raw_nsrcs = len(raw_data)
+
     # filter the data to only include SNR>10 sources
     if sigcol is not None and noisecol is not None:
         flux_mask = np.where(raw_data[sigcol] / raw_data[noisecol] > SNR)
@@ -97,9 +99,14 @@ def make_pix_models(
         # argsort goes in ascending order, so select from the end
         sort_idx = np.argsort(data[sigcol])[0][-max_sources:]
         data = data[sort_idx]
-        print("Selected {0} brightest sources".format(max_sources))
+        print("Selecting {0} brightest sources...".format(max_sources))
 
-    print("Using {0} sources to construct the pixel offset model".format(len(data)))
+    print(
+        "Selected {0} of {1} available sources to construct the pixel offset model".format(
+            len(data)
+        ),
+        raw_nsrcs,
+    )
 
     start = time()
 
