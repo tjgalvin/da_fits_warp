@@ -99,7 +99,11 @@ def make_pix_models(
         # argsort goes in ascending order, so select from the end
         sort_idx = np.argsort(data[sigcol])[0][-max_sources:]
         data = data[sort_idx]
-        print("Selecting {0} brightest sources...".format(max_sources))
+        print(
+            "Selecting the {0} brightest of {1} sources...".format(
+                max_sources, raw_nsrcs
+            )
+        )
 
     print(
         "Selected {0} of {1} available sources to construct the pixel offset model".format(
