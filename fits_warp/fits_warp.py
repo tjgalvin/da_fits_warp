@@ -107,7 +107,7 @@ def make_pix_models(
 
     print(
         "Selected {0} of {1} available sources to construct the pixel offset model".format(
-            len(data)
+            len(data), raw_nsrcs
         ),
         raw_nsrcs,
     )
