@@ -96,14 +96,22 @@ def make_pix_models(
         data = raw_data
 
     if max_sources is not None:
-        # argsort goes in ascending order, so select from the end
-        sort_idx = np.argsort(data[sigcol])[0][-max_sources:]
-        data = data[sort_idx]
-        print(
-            "Selecting the {0} brightest of {1} sources...".format(
-                max_sources, raw_nsrcs
+        if sigcol is not None:
+            # argsort goes in ascending order, so select from the end
+            sort_idx = np.argsort(data[sigcol])[0][-max_sources:]
+            print(
+                "Selecting the {0} brightest of {1} sources...".format(
+                    max_sources, raw_nsrcs
+                )
             )
-        )
+        else:
+            # This really should not be used...
+            sort_idx = np.random.choice(
+                np.arange(len(data)), size=max_sources, replace=False
+            )
+            print("Randomly selecting {0} sources...".format(max_sources))
+
+        data = data[sort_idx]
 
     print(
         "Selected {0} of {1} available sources to construct the pixel offset model".format(
