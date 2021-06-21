@@ -98,13 +98,16 @@ def make_pix_models(
     if max_sources is not None:
         if sigcol is not None:
             # argsort goes in ascending order, so select from the end
-            sort_idx = np.argsort(data[sigcol])[0][-max_sources:]
+            sort_idx = np.squeeze(np.argsort(data[sigcol]))[-max_sources:]
             print(
                 "Selecting the {0} brightest of {1} sources...".format(
                     max_sources, raw_nsrcs
                 )
             )
         else:
+            if max_sources > len(data):
+                print("Maximum number of sources larger than number of available. ")
+                max_sources = len(data) - 1
             # This really should not be used...
             sort_idx = np.random.choice(
                 np.arange(len(data)), size=max_sources, replace=False
