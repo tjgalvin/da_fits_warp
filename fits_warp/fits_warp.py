@@ -671,6 +671,12 @@ def warped_xmatch(
     incat = Table.read(incat)
     refcat = Table.read(refcat)
 
+    mask = (~np.isfinite(incat[ra1])) | (~np.isfinite(incat[dec1]))
+    if np.sum(mask) > 0:
+        print("WARNING: NaN position detected in the target catalogue. Excluding. ")
+        print(incat[mask])
+        incat = incat[~mask]
+
     # The data attribute is needed in case either table carries with it a unit metavalue. If
     # it can not be parsed then the below will fail without the data, as SkyCoord ignores the
     # specified unit
@@ -694,7 +700,7 @@ def warped_xmatch(
     # accept only matches within radius
     distance_mask = np.where(dist.degree < radius)  # this mask is into tcat_offset
     match_mask = idx[distance_mask]  # this mask is into rcat_offset
-    print(len(match_mask))
+    print(f"Initial match found {len(match_mask)} matches")
 
     # calculate the ra/dec shifts
     dlon = rcat_offset.lon[match_mask] - tcat_offset.lon[distance_mask]
@@ -705,6 +711,7 @@ def warped_xmatch(
         tcat_offset.lon + np.mean(dlon), tcat_offset.lat + np.mean(dlat), frame=center
     )
 
+    print("Beginning iterative warped cross-match procedure...")
     # now do this again 3 more times but using the Rbf
     for i in range(3):
         # crossmatch the two catalogs
@@ -755,6 +762,8 @@ def warped_xmatch(
     match_mask = idx[distance_mask]  # this mask is into tcat_offset
     # print("Final mask {0}".format(len(match_mask)))
     xmatch = hstack([incat[distance_mask], refcat[match_mask]])
+
+    print(f"Final cross-match found {len(match_mask)} matches")
 
     # return a warped version of the target catalogue and the final cross matched table
     tcat_corrected = tcat_offset.transform_to(target_cat)
