@@ -1,27 +1,34 @@
 #! /usr/bin/env python
 from __future__ import print_function
+import logging
+import warnings
 import numpy as np
 import os
+import sys
+import glob
+from time import time, sleep
+import argparse
+
 import textwrap
 from scipy import interpolate
 from scipy.interpolate import CloughTocher2DInterpolator
-import astropy
+from astropy.stats.circstats import circmean
+from astropy.utils.exceptions import AstropyWarning
 from astropy import wcs
 from astropy.io import fits
 from astropy.io.votable import parse_single_table
 from astropy.coordinates import SkyCoord, Angle, Latitude, Longitude, SkyOffsetFrame
 from astropy.table import Table, hstack
 import astropy.units as u
-import os
-import sys
-import glob
-import argparse
 import psutil
 from tqdm import tqdm
-from time import time, sleep
 
 # Parallelise the code
 import multiprocessing
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(format="%(module)s:%(levelname)s:%(lineno)d %(message)s")
+logger.setLevel(logging.INFO)
 
 __author__ = ["Natasha Hurley-Walker", "Paul Hancock"]
 __date__ = "2019-08-08"
@@ -77,12 +84,16 @@ def make_pix_models(
     :return: (dxmodel, dymodel)
     """
     filename, file_extension = os.path.splitext(fname)
-    if file_extension == ".fits":
-        raw_data = fits.open(fname)[1].data
-    elif file_extension == ".vot":
-        raw_data = parse_single_table(fname).array
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=AstropyWarning)
+        logger.debug("Opening {0}".format(fname))
+        if file_extension == ".fits":
+            raw_data = fits.open(fname)[1].data
+        elif file_extension == ".vot":
+            raw_data = parse_single_table(fname).array
 
     # get the wcs
+    logger.debug("Getting header")
     hdr = fits.getheader(fitsname)
     imwcs = wcs.WCS(hdr, naxis=2)
 
@@ -99,24 +110,26 @@ def make_pix_models(
         if sigcol is not None:
             # argsort goes in ascending order, so select from the end
             sort_idx = np.squeeze(np.argsort(data[sigcol]))[-max_sources:]
-            print(
+            logger.info(
                 "Selecting the {0} brightest of {1} sources...".format(
                     max_sources, raw_nsrcs
                 )
             )
         else:
             if max_sources > len(data):
-                print("Maximum number of sources larger than number of available. ")
+                logger.info(
+                    "Maximum number of sources larger than number of available. "
+                )
                 max_sources = len(data) - 1
             # This really should not be used...
             sort_idx = np.random.choice(
                 np.arange(len(data)), size=max_sources, replace=False
             )
-            print("Randomly selecting {0} sources...".format(max_sources))
+            logger.info("Randomly selecting {0} sources...".format(max_sources))
 
         data = data[sort_idx]
 
-    print(
+    logger.info(
         "Selected {0} of {1} available sources to construct the pixel offset model".format(
             len(data), raw_nsrcs
         ),
@@ -138,7 +151,7 @@ def make_pix_models(
         cat_xy[:, 0], cat_xy[:, 1], diff_xy[:, 1], function="linear", smooth=smooth
     )
 
-    print("Model created in {0} seconds".format(time() - start))
+    logger.info("Model created in {0} seconds".format(time() - start))
 
     if plots:
         import matplotlib
@@ -154,7 +167,7 @@ def make_pix_models(
 
             cmap = matplotlib.colors.ListedColormap(sns.color_palette("husl", 256))
         except ImportError:
-            print("seaborne not detected; using hsv color scheme")
+            logger.debug("seaborne not detected; using hsv color scheme")
             cmap = "hsv"
         # Attractive serif fonts
         if latex is True:
@@ -165,9 +178,9 @@ def make_pix_models(
                     rc("text", usetex=True)
                     rc("font", **{"family": "serif", "serif": ["serif"]})
                 except:
-                    print("rc not detected; using sans serif fonts")
+                    logger.info("rc not detected; using sans serif fonts")
             else:
-                print("latex not detected; using sans serif fonts")
+                logger.info("latex not detected; using sans serif fonts")
         xmin, xmax = 0, hdr["NAXIS1"]
         ymin, ymax = 0, hdr["NAXIS2"]
 
@@ -343,7 +356,7 @@ def multiprocess_progress(cores, func, args, progress, tqdm_desc=None):
     and wrap with a progress bar if requested
     """
     # start a new process for each task
-    with multiprocessing.Pool(processes=cores, maxtasksperchild=1) as pool:
+    with multiprocessing.Pool(processes=cores, maxtasksperchild=24) as pool:
         try:
             if progress:
                 results = [
@@ -356,7 +369,7 @@ def multiprocess_progress(cores, func, args, progress, tqdm_desc=None):
                 ]
                 sleep(4)  # might help with a join timeout error?
             else:
-                print("Running {0} stage".format(tqdm_desc))
+                logger.info("Running {0} stage".format(tqdm_desc))
                 results = pool.map_async(func, args, chunksize=1).get(timeout=10000000)
 
         except KeyboardInterrupt:
@@ -393,23 +406,23 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
         mem = int(psutil.virtual_memory().available * 0.75)
     else:
         mem = int(vm * 1e9)  # GB to B
-    print("Detected memory ~{0}GB".format(mem / 2 ** 30))
+    logger.info("Detected memory ~{0}GB".format(mem / 2 ** 30))
     # 32-bit floats, bit to byte conversion, MB conversion
-    print("Image is {0}MB".format(nx * ny * 32 / (8 * 2 ** 20)))
+    logger.info("Image is {0}MB".format(nx * ny * 32 / (8 * 2 ** 20)))
     pixmem = 20000
-    print("Allowing {0}kB per pixel".format(pixmem / 2 ** 10))
+    logger.info("Allowing {0}kB per pixel".format(pixmem / 2 ** 10))
     stride = mem / pixmem
     # Make sure stride is row-divisible
     stride = (stride // ny) * ny
     # Generally if this is true, the images are so small that you don't want to waste
     # system time setting up a big complex operation
     if len(x) < stride:
-        print("Calculating all pixel offsets at once.")
+        logger.info("Calculating all pixel offsets at once.")
         x += dxmodel(x, y)
         y += dymodel(xy[1, :], y)
     else:
         if cores == 1:
-            print(
+            logger.info(
                 "Applying corrections to pixel co-ordinates {0} rows at a time, using a single core".format(
                     stride // ny
                 )
@@ -427,7 +440,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
                 n += 1
                 sys.stdout.write("{0:3.0f}%...".format(100 * n / len(borders)))
                 sys.stdout.flush()
-            print("")
+            logger.info("")
         else:
             # Ensure each core gets enough memory
             stride /= cores
@@ -435,7 +448,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
             # When using a pool, you need to send the arguments as a tuple through the
             # wrapping function, so we set up the arguments here before running the pool
             args = []
-            print(
+            logger.info(
                 "Applying corrections to pixel co-ordinates {0} rows at a time across {1} cores".format(
                     stride // ny, cores
                 )
@@ -455,7 +468,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
                 cores, _fmx, args, progress, tqdm_desc="x-offsets"
             )
 
-            print("Reordering x-offset results")
+            logger.info("Reordering x-offset results")
             indices, offsets = map(list, zip(*results))
             # Order correctly
             ind = np.argsort(indices)
@@ -473,7 +486,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
                 cores, _fmy, args, progress, tqdm_desc="y-offsets"
             )
 
-            print("Reordering y-offset results")
+            logger.info("Reordering y-offset results")
             indices, offsets = map(list, zip(*results))
             # Order correctly
             ind = np.argsort(indices)
@@ -485,7 +498,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
             y += np.array(o)
 
     if testimage is True:
-        print("Creating divergence maps")
+        logger.info("Creating divergence maps")
         start = time()
         # Save the divergence as a fits image
         im = fits.open(fnames[0])
@@ -500,7 +513,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
         im.writeto(outputname + "_delx.fits", overwrite=True)
         im[0].data = (y - np.array(xy[0, :])).reshape((nx, ny))
         im.writeto(outputname + "_dely.fits", overwrite=True)
-        print("finished divergence map in {0} seconds".format(time() - start))
+        logger.info("finished divergence map in {0} seconds".format(time() - start))
 
         del im
 
@@ -535,13 +548,13 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
         # Replace NaNs with zeroes because otherwise it breaks the interpolation
         nandices = np.isnan(data)
         data[nandices] = 0.0
-        print("interpolating {0}".format(fname))
+        logger.info("interpolating {0}".format(fname))
         # We have the "all at once" option inside the cores=1 option this time, because
         # even on a high-memory system, it is faster to parallelise the interpolation than
         # to rely on scipy to do it all at once
         if cores == 1:
             if len(x) > stride:
-                print(
+                logger.info(
                     "Interpolating {0} rows at a time using a single core".format(
                         stride // data.shape[0]
                     )
@@ -549,7 +562,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
                 # We need a fresh copy of the data because otherwise we will be trying to
                 # interpolate over the results of our interpolation
                 newdata = np.copy(data)
-                print("Remapping data", end="")
+                logger.info("Remapping data", end="")
                 n = 0
                 borders = range(0, len(x) + 1, stride)
                 if borders[-1] != len(x):
@@ -572,23 +585,23 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
                     n += 1
                     sys.stdout.write("{0:3.0f}%...".format(100 * n / len(borders)))
                     sys.stdout.flush()
-                print("")
+                logger.info("")
                 # Float32 instead of Float64 since the precision is meaningless
-                print("int64 -> int32")
+                logger.info("int64 -> int32")
                 data = np.float32(newdata)
             else:
-                print("all at once")
+                logger.info("all at once")
                 model = CloughTocher2DInterpolator(np.transpose([x, y]), np.ravel(data))
                 newdata = model(xy[1, :], xy[0, :])
                 # Float32 instead of Float64 since the precision is meaningless
-                print("int64 -> int32")
+                logger.info("int64 -> int32")
                 data = np.float32(newdata)
         else:
             # Testing shows that larger strides go OOM for the parallel version
-            stride /= 4
+            stride /= 8
             # Make sure it is row-divisible
             stride = (stride // ny) * ny
-            print(
+            logger.info(
                 "Interpolating {0} rows at a time across {1} cores".format(
                     stride // ny, cores
                 )
@@ -598,6 +611,8 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
             borders = list(range(0, len(x) + 1, int(stride)))
             if borders[-1] != len(x):
                 borders.append(len(x))
+
+            logger.info("Building segmented image set")
             for a, b in zip(borders, borders[1:]):
                 # indexes into the image based on the index into the raveled data
                 idx = np.unravel_index(range(a, b), data.shape)
@@ -610,8 +625,9 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
                 #                calc(x1 = x[ap:bp], y1 = y[ap:bp], data = data[idxp], x2 = xy[1, a:b], y2 = xy[0, a:b])
                 args.append((n, x[ap:bp], y[ap:bp], xy[1, a:b], xy[0, a:b], data[idxp]))
                 n += 1
+                logger.debug(n)
 
-            #    # start a new process for each task
+            # start a new process for each task
             results = multiprocess_progress(
                 cores, _fmm, args, progress, tqdm_desc="Sky interpolation"
             )
@@ -624,12 +640,12 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
             # Flatten list of lists
             n = [item for sublist in pixvals for item in sublist]
             # Float32 instead of Float64 since the precision is meaningless
-            print("int64 -> int32")
+            logger.info("int64 -> int32")
             newdata = np.array(n, dtype="float32")
 
         data = newdata.reshape(squeezedshape)
         # NaN the edges by 10 pixels to avoid weird edge effects
-        print("blanking edges")
+        logger.info("blanking edges")
         data[0:10, :] = np.nan
         data[:, 0:10] = np.nan
         data[:, -10 : data.shape[0]] = np.nan
@@ -637,9 +653,9 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
         # Re-apply any previous NaN mask to the data
         data[nandices] = np.nan
         im[0].data = data.reshape(oldshape)
-        print("saving...")
+        logger.info("saving...")
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
-        print("wrote {0}".format(fout))
+        logger.info("wrote {0}".format(fout))
         # Explicitly delete potential memory hogs
         del im, data
     return
@@ -667,14 +683,16 @@ def warped_xmatch(
     :param radius: initial matching radius in degrees
     :return:
     """
-    # check for incat/refcat as as strings, and load the file if it is
-    incat = Table.read(incat)
-    refcat = Table.read(refcat)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=AstropyWarning)
+        # check for incat/refcat as as strings, and load the file if it is
+        incat = Table.read(incat)
+        refcat = Table.read(refcat)
 
     mask = (~np.isfinite(incat[ra1])) | (~np.isfinite(incat[dec1]))
     if np.sum(mask) > 0:
-        print("WARNING: NaN position detected in the target catalogue. Excluding. ")
-        print(incat[mask])
+        logger.warn("NaN position detected in the target catalogue. Excluding. ")
+        logger.warn(incat[mask])
         incat = incat[~mask]
 
     # The data attribute is needed in case either table carries with it a unit metavalue. If
@@ -687,9 +705,12 @@ def warped_xmatch(
         refcat[ra2].data, refcat[dec2].data, unit=(u.degree, u.degree), frame="icrs"
     )
 
-    center = SkyOffsetFrame(
-        origin=SkyCoord(np.mean(target_cat.ra), np.mean(target_cat.dec), frame="icrs")
+    center_pos = SkyCoord(
+        circmean(target_cat.ra), np.mean(target_cat.dec), frame="icrs"
     )
+    center = SkyOffsetFrame(origin=center_pos)
+
+    logger.debug("Mean center posion {0}, {1}".format(center_pos.ra, center_pos.dec))
 
     tcat_offset = target_cat.transform_to(center)
     rcat_offset = ref_cat.transform_to(center)
@@ -700,7 +721,7 @@ def warped_xmatch(
     # accept only matches within radius
     distance_mask = np.where(dist.degree < radius)  # this mask is into tcat_offset
     match_mask = idx[distance_mask]  # this mask is into rcat_offset
-    print(f"Initial match found {len(match_mask)} matches")
+    logger.info(f"Initial match found {len(match_mask)} matches")
 
     # calculate the ra/dec shifts
     dlon = rcat_offset.lon[match_mask] - tcat_offset.lon[distance_mask]
@@ -711,9 +732,10 @@ def warped_xmatch(
         tcat_offset.lon + np.mean(dlon), tcat_offset.lat + np.mean(dlat), frame=center
     )
 
-    print("Beginning iterative warped cross-match procedure...")
+    logger.info("Beginning iterative warped cross-match procedure...")
     # now do this again 3 more times but using the Rbf
     for i in range(3):
+        logger.debug("Cross match iteration {0}".format(i))
         # crossmatch the two catalogs
         idx, dist, _ = tcat_offset.match_to_catalog_sky(rcat_offset)
         # accept only matches within radius
@@ -760,10 +782,10 @@ def warped_xmatch(
     # accept only matches within radius
     distance_mask = np.where(dist.degree < radius)  # this mask is into cat
     match_mask = idx[distance_mask]  # this mask is into tcat_offset
-    # print("Final mask {0}".format(len(match_mask)))
+    # logger.info("Final mask {0}".format(len(match_mask)))
     xmatch = hstack([incat[distance_mask], refcat[match_mask]])
 
-    print(f"Final cross-match found {len(match_mask)} matches")
+    logger.info(f"Final cross-match found {len(match_mask)} matches")
 
     # return a warped version of the target catalogue and the final cross matched table
     tcat_corrected = tcat_offset.transform_to(target_cat)
@@ -901,6 +923,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Provide a progress bar for stages that are distributed into work-units",
     )
+    group3.add_argument(
+        "--verbose",
+        default=False,
+        action="store_true",
+        help="Provide extra logging throughout the procedure",
+    )
     group4 = parser.add_argument_group("Crossmatching input/output files")
     group4.add_argument(
         "--incat",
@@ -936,7 +964,7 @@ if __name__ == "__main__":
         dest="cite",
         default=False,
         action="store_true",
-        help="Print citation in BibTeX format.",
+        help="logger.info citation in BibTeX format.",
     )
 
     results = parser.parse_args()
@@ -945,8 +973,11 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit()
 
+    if results.verbose:
+        logger.setLevel(logging.DEBUG)
+
     if results.cite is True:
-        print(
+        logger.info(
             """
 Thanks for using fits_warp! To cite this package, please use the following BibTeX:
 
@@ -955,7 +986,7 @@ Thanks for using fits_warp! To cite this package, please use the following BibTe
                     title = \"{De-distorting ionospheric effects in the image plane}\",
                   journal = {Astronomy and Computing},
                 archivePrefix = \"arXiv\",
-                   eprint = {1808.08017},
+                   elogger.info = {1808.08017},
                  primaryClass = \"astro-ph.IM\",
                  keywords = {Astrometry, Radio astronomy, Algorithms, Ionosphere},
                      year = 2018,
@@ -987,11 +1018,16 @@ Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25..
                 ra2=results.ra2,
                 dec2=results.dec2,
             )
-            xmcat.write(results.xm, overwrite=True)
-            print("Wrote {0}".format(results.xm))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=AstropyWarning)
+                xmcat.write(results.xm, overwrite=True)
+                logger.info("Wrote {0}".format(results.xm))
+
             if results.corrected is not None:
-                corrected.write(results.corrected, overwrite=True)
-                print("Wrote {0}".format(results.corrected))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=AstropyWarning)
+                    corrected.write(results.corrected, overwrite=True)
+                    logger.info("Wrote {0}".format(results.corrected))
 
     if results.infits is not None:
         if results.xm is not None:
@@ -1022,9 +1058,11 @@ Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25..
                     progress=results.progress,
                 )
             else:
-                print("No output fits file specified via --suffix; not doing warping")
+                logger.info(
+                    "No output fits file specified via --suffix; not doing warping"
+                )
         else:
-            print(
+            logger.info(
                 "Must specify a cross-matched catalogue via --xm to perform the warping."
             )
 
