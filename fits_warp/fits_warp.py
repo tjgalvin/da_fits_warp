@@ -562,7 +562,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
                 # We need a fresh copy of the data because otherwise we will be trying to
                 # interpolate over the results of our interpolation
                 newdata = np.copy(data)
-                logger.info("Remapping data", end="")
+                logger.info("Remapping data")
                 n = 0
                 borders = range(0, len(x) + 1, stride)
                 if borders[-1] != len(x):
