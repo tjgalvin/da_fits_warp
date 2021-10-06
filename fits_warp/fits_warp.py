@@ -564,7 +564,8 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
                 newdata = np.copy(data)
                 logger.info("Remapping data")
                 n = 0
-                borders = range(0, len(x) + 1, stride)
+                logger.info(f"Stride is {stride}")
+                borders = list(range(0, len(x) + 1, int(stride)))
                 if borders[-1] != len(x):
                     borders.append(len(x))
                 for a, b in zip(borders, borders[1:]):
@@ -669,6 +670,7 @@ def warped_xmatch(
     ra2="RAJ2000",
     dec2="DEJ2000",
     radius=2 / 60.0,
+    enforce_min_srcs=None
 ):
     """
     Create a cross match solution between two catalogues that accounts for bulk shifts and image warping.
@@ -681,6 +683,7 @@ def warped_xmatch(
     :param ra1, dec1: column names for ra/dec in the input catalogue
     :param ra2, dec2: column names for ra/dec in the reference catalogue
     :param radius: initial matching radius in degrees
+    :param enforce_min_sources: If not None, an exception is raised if there are fewer than this many sources found
     :return:
     """
     with warnings.catch_warnings():
@@ -786,6 +789,9 @@ def warped_xmatch(
     xmatch = hstack([incat[distance_mask], refcat[match_mask]])
 
     logger.info(f"Final cross-match found {len(match_mask)} matches")
+    if enforce_min_srcs is not None and len(match_mask) < enforce_min_srcs:
+        logger.info(f"Fewer than {enforce_min_srcs} matches found, not creating warped file...")
+        raise ValueError(f"Fewer than {enforce_min_srcs} matches found. ")
 
     # return a warped version of the target catalogue and the final cross matched table
     tcat_corrected = tcat_offset.transform_to(target_cat)
@@ -918,6 +924,12 @@ if __name__ == "__main__":
         help="Maximum number of sources used when constructing the distortion model. Default behaviour will use all available matches. ",
     )
     group3.add_argument(
+        '--enforce-min-srcs',
+        default=None,
+        type=int,
+        help='An exception is raised if there are fewer than this many cross-matched sources located in the internal cross-match procedure. '
+    )
+    group3.add_argument(
         "--progress",
         default=False,
         action="store_true",
@@ -1017,6 +1029,7 @@ Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25..
                 dec1=results.dec1,
                 ra2=results.ra2,
                 dec2=results.dec2,
+                enforce_min_srcs=results.enforce_min_srcs
             )
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=AstropyWarning)
