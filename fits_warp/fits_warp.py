@@ -692,7 +692,9 @@ def warped_xmatch(
         incat = Table.read(incat)
         refcat = Table.read(refcat)
 
-    mask = (~np.isfinite(incat[ra1])) | (~np.isfinite(incat[dec1]))
+    # Casting to an array is used to avoid some behaviour when MackedColumns would fill invalid 
+    # values with a default. Seems a astropy / numpy change upstream made this an issue. 
+    mask = (~np.isfinite(np.array(incat[ra1]))) | (~np.isfinite(np.array(incat[dec1])))
     if np.sum(mask) > 0:
         logger.warn("NaN position detected in the target catalogue. Excluding. ")
         logger.warn(incat[mask])
