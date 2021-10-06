@@ -696,8 +696,8 @@ def warped_xmatch(
     # values with a default. Seems a astropy / numpy change upstream made this an issue. 
     mask = (~np.isfinite(np.array(incat[ra1]))) | (~np.isfinite(np.array(incat[dec1])))
     if np.sum(mask) > 0:
-        logger.warn("NaN position detected in the target catalogue. Excluding. ")
-        logger.warn(incat[mask])
+        logger.warning("NaN position detected in the target catalogue. Excluding. ")
+        logger.warning(incat[mask])
         incat = incat[~mask]
 
     # The data attribute is needed in case either table carries with it a unit metavalue. If
