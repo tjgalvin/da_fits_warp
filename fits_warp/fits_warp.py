@@ -1,71 +1,135 @@
 #! /usr/bin/env python
-from __future__ import print_function
+import argparse
+import glob
 import logging
-import warnings
-import numpy as np
+import multiprocessing
 import os
 import sys
-import glob
-from time import time, sleep
-import argparse
+import warnings
+from time import sleep, time
+from pathlib import Path
+from typing import Optional, Any
 
-import textwrap
-from scipy import interpolate
-from scipy.interpolate import CloughTocher2DInterpolator
-from astropy.stats.circstats import circmean
-from astropy.utils.exceptions import AstropyWarning
+import astropy.units as u
+import matplotlib.pyplot as plt
+import numpy as np
+import psutil
 from astropy import wcs
+from astropy.coordinates import SkyCoord, SkyOffsetFrame
 from astropy.io import fits
 from astropy.io.votable import parse_single_table
-from astropy.coordinates import SkyCoord, Angle, Latitude, Longitude, SkyOffsetFrame
+from astropy.stats.circstats import circmean
 from astropy.table import Table, hstack
-import astropy.units as u
-import psutil
+from astropy.utils.exceptions import AstropyWarning
+from matplotlib import gridspec, pyplot
+from scipy import interpolate
+from scipy.interpolate import CloughTocher2DInterpolator
 from tqdm import tqdm
-
-# Parallelise the code
-import multiprocessing
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(module)s:%(levelname)s:%(lineno)d %(message)s")
 logger.setLevel(logging.INFO)
 
-__author__ = ["Natasha Hurley-Walker", "Paul Hancock"]
-__date__ = "2019-08-08"
 
+def make_source_plot(
+    fname: Path,
+    hdr: dict[str, Any],
+    cat_xy: np.ndarray,
+    diff_xy: np.ndarray,
+    cmap: str = "hsv",
+) -> None:
+    xmin, xmax = 0, hdr["NAXIS1"]
+    ymin, ymax = 0, hdr["NAXIS2"]
 
-def is_exe(fpath):
-    return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+    gx, gy = np.mgrid[
+        xmin : xmax : (xmax - xmin) / 50.0, ymin : ymax : (ymax - ymin) / 50.0
+    ]
+    mdx = dxmodel(np.ravel(gx), np.ravel(gy))
+    mdy = dymodel(np.ravel(gx), np.ravel(gy))
+    x = cat_xy[:, 0]
+    y = cat_xy[:, 1]
 
+    # plot w.r.t. centre of image, in degrees
+    try:
+        delX = abs(hdr["CD1_1"])
+        delY = abs(hdr["CD2_2"])
+    except:
+        delX = abs(hdr["CDELT1"])
+        delY = abs(hdr["CDELT2"])
 
-def which(program):
-    fpath, fname = os.path.split(program)
-    if fpath:
-        if is_exe(program):
-            return program
-    else:
-        for path in os.environ["PATH"].split(os.pathsep):
-            path = path.strip('"')
-            exe_file = os.path.join(path, program)
-            if is_exe(exe_file):
-                return exe_file
-    return None
+    # shift all co-ordinates and put them in degrees
+    x -= hdr["NAXIS1"] / 2
+    gx -= hdr["NAXIS1"] / 2
+    xmin -= hdr["NAXIS1"] / 2
+    xmax -= hdr["NAXIS1"] / 2
+    x *= delX
+    gx *= delX
+    xmin *= delX
+    xmax *= delX
+    y -= hdr["NAXIS2"] / 2
+    gy -= hdr["NAXIS2"] / 2
+    ymin -= hdr["NAXIS2"] / 2
+    ymax -= hdr["NAXIS2"] / 2
+    y *= delY
+    gy *= delY
+    ymin *= delY
+    ymax *= delY
+    scale = 1
+
+    dx = diff_xy[:, 0]
+    dy = diff_xy[:, 1]
+
+    fig = plt.figure(figsize=(12, 6))
+    gs = gridspec.GridSpec(100, 100)
+    gs.update(hspace=0, wspace=0)
+    kwargs = {
+        "angles": "xy",
+        "scale_units": "xy",
+        "scale": scale,
+        "cmap": cmap,
+        "clim": [-180, 180],
+    }
+    angles = np.degrees(np.arctan2(dy, dx))
+    ax = fig.add_subplot(gs[0:100, 0:48])
+    cax = ax.quiver(x, y, dx, dy, angles, **kwargs)
+    ax.set_xlim((xmin, xmax))
+    ax.set_ylim((ymin, ymax))
+    ax.set_xlabel("Distance from pointing centre / degrees")
+    ax.set_ylabel("Distance from pointing centre / degrees")
+    ax.set_title("Source position offsets / arcsec")
+
+    ax = fig.add_subplot(gs[0:100, 49:97])
+    cax = ax.quiver(gx, gy, mdx, mdy, np.degrees(np.arctan2(mdy, mdx)), **kwargs)
+    ax.set_xlim((xmin, xmax))
+    ax.set_ylim((ymin, ymax))
+    ax.set_xlabel("Distance from pointing centre / degrees")
+    ax.tick_params(axis="y", labelleft="off")
+    ax.set_title("Model position offsets / arcsec")
+
+    # Color bar
+    ax2 = fig.add_subplot(gs[0:100, 98:100])
+    cbar3 = plt.colorbar(cax, cax=ax2, use_gridspec=True)
+    cbar3.set_label("Angle CCW from West / degrees")  # ,labelpad=-75)
+    cbar3.ax.yaxis.set_ticks_position("right")
+
+    outname = fname.with_suffix(".png")
+
+    fig.savefig(outname, dpi=200)
 
 
 def make_pix_models(
-    fname,
-    ra1="ra",
-    dec1="dec",
+    fname: Path,
+    ra1: str = "ra",
+    dec1: str = "dec",
     ra2="RAJ2000",
-    dec2="DEJ2000",
-    fitsname=None,
-    plots=False,
-    smooth=300.0,
-    sigcol=None,
-    noisecol=None,
-    SNR=10,
-    latex=False,
-    max_sources=None,
+    dec2: str = "DEJ2000",
+    fitsname: Optional[Path] = None,
+    plots: bool = False,
+    smooth: float = 300.0,
+    sigcol: Optional[str] = None,
+    noisecol: Optional[str] = None,
+    SNR: float = 10,
+    max_sources: Optional[int] = None,
 ):
     """
     Read a fits file which contains the crossmatching results for two catalogues.
@@ -83,14 +147,20 @@ def make_pix_models(
     :param max_sources: Maximum number of sources to include in the construction of the warping model (defaults to None, use all sources)
     :return: (dxmodel, dymodel)
     """
-    filename, file_extension = os.path.splitext(fname)
+    file_extension = fname.stem
+    logger.debug(f"File extension of {fname} is {file_extension}.")
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=AstropyWarning)
-        logger.debug("Opening {0}".format(fname))
+        logger.debug(f"Opening {fname}")
         if file_extension == ".fits":
+            logger.info(f"Opening fits file {fname=}")
             raw_data = fits.open(fname)[1].data
         elif file_extension == ".vot":
+            logger.info(f"Opening VOTable {fname=}.")
             raw_data = parse_single_table(fname).array
+        else:
+            raise ValueError(f"File format of {fname} is not supported. ")
 
     # get the wcs
     logger.debug("Getting header")
@@ -100,39 +170,34 @@ def make_pix_models(
     raw_nsrcs = len(raw_data)
 
     # filter the data to only include SNR>10 sources
-    if sigcol is not None and noisecol is not None:
+    if None not in (sigcol, noisecol):
+        logger.debug(
+            f"Filtering {SNR=} sources using {sigcol=} and {noisecol} columns. "
+        )
         flux_mask = np.where(raw_data[sigcol] / raw_data[noisecol] > SNR)
         data = raw_data[flux_mask]
     else:
         data = raw_data
 
-    if max_sources is not None:
-        if sigcol is not None:
-            # argsort goes in ascending order, so select from the end
-            sort_idx = np.squeeze(np.argsort(data[sigcol]))[-max_sources:]
-            logger.info(
-                "Selecting the {0} brightest of {1} sources...".format(
-                    max_sources, raw_nsrcs
-                )
-            )
-        else:
-            if max_sources > len(data):
-                logger.info(
-                    "Maximum number of sources larger than number of available. "
-                )
-                max_sources = len(data) - 1
-            # This really should not be used...
+    if max_sources is not None and max_sources < len(data) - 1:
+        if sigcol is None:
+            # Will help to ensure sources are uniformly sampled from
+            # across the field
             sort_idx = np.random.choice(
                 np.arange(len(data)), size=max_sources, replace=False
             )
-            logger.info("Randomly selecting {0} sources...".format(max_sources))
+            logger.info(f"Randomly selecting {max_sources} sources...")
+        else:
+            # argsort goes in ascending order, so select from the end
+            sort_idx = np.squeeze(np.argsort(data[sigcol]))[-max_sources:]
+            logger.info(
+                f"Selecting the {max_sources} brightest of {raw_nsrcs} sources..."
+            )
 
         data = data[sort_idx]
 
     logger.info(
-        "Selected {0} of {1} available sources to construct the pixel offset model".format(
-            len(data), raw_nsrcs
-        ),
+        f"Selected {len(data)} of {raw_nsrcs} available sources to construct the pixel offset model."
     )
 
     start = time()
@@ -151,115 +216,10 @@ def make_pix_models(
         cat_xy[:, 0], cat_xy[:, 1], diff_xy[:, 1], function="linear", smooth=smooth
     )
 
-    logger.info("Model created in {0} seconds".format(time() - start))
+    logger.info(f"Model created in {time() - start} seconds.")
 
     if plots:
-        import matplotlib
-
-        # Super-computer-safe
-        matplotlib.use("Agg")
-        from matplotlib import pyplot
-        from matplotlib import gridspec
-
-        # Perceptually uniform cyclic color schemes
-        try:
-            import seaborn as sns
-
-            cmap = matplotlib.colors.ListedColormap(sns.color_palette("husl", 256))
-        except ImportError:
-            logger.debug("seaborne not detected; using hsv color scheme")
-            cmap = "hsv"
-        # Attractive serif fonts
-        if latex is True:
-            if which("latex"):
-                try:
-                    from matplotlib import rc
-
-                    rc("text", usetex=True)
-                    rc("font", **{"family": "serif", "serif": ["serif"]})
-                except:
-                    logger.info("rc not detected; using sans serif fonts")
-            else:
-                logger.info("latex not detected; using sans serif fonts")
-        xmin, xmax = 0, hdr["NAXIS1"]
-        ymin, ymax = 0, hdr["NAXIS2"]
-
-        gx, gy = np.mgrid[
-            xmin : xmax : (xmax - xmin) / 50.0, ymin : ymax : (ymax - ymin) / 50.0
-        ]
-        mdx = dxmodel(np.ravel(gx), np.ravel(gy))
-        mdy = dymodel(np.ravel(gx), np.ravel(gy))
-        x = cat_xy[:, 0]
-        y = cat_xy[:, 1]
-
-        # plot w.r.t. centre of image, in degrees
-        try:
-            delX = abs(hdr["CD1_1"])
-        except:
-            delX = abs(hdr["CDELT1"])
-        try:
-            delY = hdr["CD2_2"]
-        except:
-            delY = hdr["CDELT2"]
-        # shift all co-ordinates and put them in degrees
-        x -= hdr["NAXIS1"] / 2
-        gx -= hdr["NAXIS1"] / 2
-        xmin -= hdr["NAXIS1"] / 2
-        xmax -= hdr["NAXIS1"] / 2
-        x *= delX
-        gx *= delX
-        xmin *= delX
-        xmax *= delX
-        y -= hdr["NAXIS2"] / 2
-        gy -= hdr["NAXIS2"] / 2
-        ymin -= hdr["NAXIS2"] / 2
-        ymax -= hdr["NAXIS2"] / 2
-        y *= delY
-        gy *= delY
-        ymin *= delY
-        ymax *= delY
-        scale = 1
-
-        dx = diff_xy[:, 0]
-        dy = diff_xy[:, 1]
-
-        fig = pyplot.figure(figsize=(12, 6))
-        gs = gridspec.GridSpec(100, 100)
-        gs.update(hspace=0, wspace=0)
-        kwargs = {
-            "angles": "xy",
-            "scale_units": "xy",
-            "scale": scale,
-            "cmap": cmap,
-            "clim": [-180, 180],
-        }
-        angles = np.degrees(np.arctan2(dy, dx))
-        ax = fig.add_subplot(gs[0:100, 0:48])
-        cax = ax.quiver(x, y, dx, dy, angles, **kwargs)
-        ax.set_xlim((xmin, xmax))
-        ax.set_ylim((ymin, ymax))
-        ax.set_xlabel("Distance from pointing centre / degrees")
-        ax.set_ylabel("Distance from pointing centre / degrees")
-        ax.set_title("Source position offsets / arcsec")
-        #        cbar = fig.colorbar(cax, orientation='horizontal')
-
-        ax = fig.add_subplot(gs[0:100, 49:97])
-        cax = ax.quiver(gx, gy, mdx, mdy, np.degrees(np.arctan2(mdy, mdx)), **kwargs)
-        ax.set_xlim((xmin, xmax))
-        ax.set_ylim((ymin, ymax))
-        ax.set_xlabel("Distance from pointing centre / degrees")
-        ax.tick_params(axis="y", labelleft="off")
-        ax.set_title("Model position offsets / arcsec")
-        #        cbar = fig.colorbar(cax, orientation='vertical')
-        # Color bar
-        ax2 = fig.add_subplot(gs[0:100, 98:100])
-        cbar3 = pyplot.colorbar(cax, cax=ax2, use_gridspec=True)
-        cbar3.set_label("Angle CCW from West / degrees")  # ,labelpad=-75)
-        cbar3.ax.yaxis.set_ticks_position("right")
-
-        outname = os.path.splitext(fname)[0] + ".png"
-        #        pyplot.show()
-        pyplot.savefig(outname, dpi=200)
+        make_source_plot(fname, hdr, cat_xy, diff_xy)
 
 
 def apply_interp(index, x1, y1, x2, y2, data):
@@ -369,7 +329,7 @@ def multiprocess_progress(cores, func, args, progress, tqdm_desc=None):
                 ]
                 sleep(4)  # might help with a join timeout error?
             else:
-                logger.info("Running {0} stage".format(tqdm_desc))
+                logger.info(f"Running {tqdm_desc} stage.")
                 results = pool.map_async(func, args, chunksize=1).get(timeout=10000000)
 
         except KeyboardInterrupt:
@@ -406,11 +366,11 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
         mem = int(psutil.virtual_memory().available * 0.75)
     else:
         mem = int(vm * 1e9)  # GB to B
-    logger.info("Detected memory ~{0}GB".format(mem / 2 ** 30))
+    logger.info("Detected memory ~{0}GB".format(mem / 2**30))
     # 32-bit floats, bit to byte conversion, MB conversion
-    logger.info("Image is {0}MB".format(nx * ny * 32 / (8 * 2 ** 20)))
+    logger.info("Image is {0}MB".format(nx * ny * 32 / (8 * 2**20)))
     pixmem = 20000
-    logger.info("Allowing {0}kB per pixel".format(pixmem / 2 ** 10))
+    logger.info("Allowing {0}kB per pixel".format(pixmem / 2**10))
     stride = mem / pixmem
     # Make sure stride is row-divisible
     stride = (stride // ny) * ny
@@ -670,7 +630,7 @@ def warped_xmatch(
     ra2="RAJ2000",
     dec2="DEJ2000",
     radius=2 / 60.0,
-    enforce_min_srcs=None
+    enforce_min_srcs=None,
 ):
     """
     Create a cross match solution between two catalogues that accounts for bulk shifts and image warping.
@@ -692,8 +652,8 @@ def warped_xmatch(
         incat = Table.read(incat)
         refcat = Table.read(refcat)
 
-    # Casting to an array is used to avoid some behaviour when MackedColumns would fill invalid 
-    # values with a default. Seems a astropy / numpy change upstream made this an issue. 
+    # Casting to an array is used to avoid some behaviour when MackedColumns would fill invalid
+    # values with a default. Seems a astropy / numpy change upstream made this an issue.
     mask = (~np.isfinite(np.array(incat[ra1]))) | (~np.isfinite(np.array(incat[dec1])))
     if np.sum(mask) > 0:
         logger.warning("NaN position detected in the target catalogue. Excluding. ")
@@ -792,7 +752,9 @@ def warped_xmatch(
 
     logger.info(f"Final cross-match found {len(match_mask)} matches")
     if enforce_min_srcs is not None and len(match_mask) < enforce_min_srcs:
-        logger.info(f"Fewer than {enforce_min_srcs} matches found, not creating warped file...")
+        logger.info(
+            f"Fewer than {enforce_min_srcs} matches found, not creating warped file..."
+        )
         raise ValueError(f"Fewer than {enforce_min_srcs} matches found. ")
 
     # return a warped version of the target catalogue and the final cross matched table
@@ -803,7 +765,6 @@ def warped_xmatch(
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
     group1 = parser.add_argument_group("Warping input/output files")
     group1.add_argument(
@@ -926,10 +887,10 @@ if __name__ == "__main__":
         help="Maximum number of sources used when constructing the distortion model. Default behaviour will use all available matches. ",
     )
     group3.add_argument(
-        '--enforce-min-srcs',
+        "--enforce-min-srcs",
         default=None,
         type=int,
-        help='An exception is raised if there are fewer than this many cross-matched sources located in the internal cross-match procedure. '
+        help="An exception is raised if there are fewer than this many cross-matched sources located in the internal cross-match procedure. ",
     )
     group3.add_argument(
         "--progress",
@@ -1031,7 +992,7 @@ Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25..
                 dec1=results.dec1,
                 ra2=results.ra2,
                 dec2=results.dec2,
-                enforce_min_srcs=results.enforce_min_srcs
+                enforce_min_srcs=results.enforce_min_srcs,
             )
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=AstropyWarning)
@@ -1080,4 +1041,3 @@ Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25..
             logger.info(
                 "Must specify a cross-matched catalogue via --xm to perform the warping."
             )
-
