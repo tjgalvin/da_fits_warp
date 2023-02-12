@@ -1,4 +1,31 @@
 #! /usr/bin/env python
+"""
+Tool to derive positional shifts of sources (presumably from the ionosphere) and, if requested, correct for. 
+
+After cross-referencing the input component caatalogue against a base catalogue, images may be reinterpolated onto a corrected pixel grid. Interpolation is performed using a radial-basis function. 
+
+Thanks for using fits_warp! To cite this package, please use the following BibTeX:
+
+        @ARTICLE{2018A&C....25...94H,
+            author = {{Hurley-Walker}, N. and {Hancock}, P.~J.},
+            title = \"{De-distorting ionospheric effects in the image plane}\",
+            journal = {Astronomy and Computing},
+        archivePrefix = \"arXiv\",
+            elogger.info = {1808.08017},
+            primaryClass = \"astro-ph.IM\",
+            keywords = {Astrometry, Radio astronomy, Algorithms, Ionosphere},
+                year = 2018,
+            month = oct,
+            volume = 25,
+            pages = {94-102},
+                doi = {10.1016/j.ascom.2018.08.006},
+            adsurl = {http://adsabs.harvard.edu/abs/2018A%26C....25...94H},
+            adsnote = {Provided by the SAO/NASA Astrophysics Data System}
+        }
+
+Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25...94H
+"""
+
 import argparse
 import glob
 import logging
@@ -6,11 +33,12 @@ import multiprocessing
 import os
 import sys
 import warnings
-from time import sleep, time
 from pathlib import Path
-from typing import Optional, Any
+from time import sleep, time
+from typing import Any, Optional, Union
 
 import astropy.units as u
+import dask.array as da
 import matplotlib.pyplot as plt
 import numpy as np
 import psutil
@@ -30,6 +58,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(module)s:%(levelname)s:%(lineno)d %(message)s")
 logger.setLevel(logging.INFO)
 
+Array = Union[da.array, np.array]
 
 def make_source_plot(
     fname: Path,
@@ -116,6 +145,24 @@ def make_source_plot(
 
     fig.savefig(outname, dpi=200)
 
+def create_divergence_map(fnames: list[Path], xy: Array, x: Array, y: Array, nx: int, ny: int) -> None:
+    logger.info("Creating divergence maps")
+    start = time()
+    # Save the divergence as a fits image
+    im = fits.open(fnames[0])
+    outputname = fnames[0].replace(".fits", "")
+    div = (
+        np.gradient((x - np.array(xy[1, :])).reshape((nx, ny)))[0]
+        + np.gradient((y - np.array(xy[0, :])).reshape((nx, ny)))[1]
+    )
+    im[0].data = div
+    im.writeto(outputname + "_div.fits", overwrite=True)
+    im[0].data = (x - np.array(xy[1, :])).reshape((nx, ny))
+    im.writeto(outputname + "_delx.fits", overwrite=True)
+    im[0].data = (y - np.array(xy[0, :])).reshape((nx, ny))
+    im.writeto(outputname + "_dely.fits", overwrite=True)
+    logger.info("finished divergence map in {0} seconds".format(time() - start))
+
 
 def make_pix_models(
     fname: Path,
@@ -147,12 +194,13 @@ def make_pix_models(
     :param max_sources: Maximum number of sources to include in the construction of the warping model (defaults to None, use all sources)
     :return: (dxmodel, dymodel)
     """
-    file_extension = fname.stem
+    file_extension = fname.suffix
     logger.debug(f"File extension of {fname} is {file_extension}.")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=AstropyWarning)
         logger.debug(f"Opening {fname}")
+        logger.debug(f"Extension is {file_extension}")
         if file_extension == ".fits":
             logger.info(f"Opening fits file {fname=}")
             raw_data = fits.open(fname)[1].data
@@ -202,10 +250,23 @@ def make_pix_models(
 
     start = time()
 
-    cat_xy = imwcs.all_world2pix(list(zip(data[ra1], data[dec1])), 1)
-    ref_xy = imwcs.all_world2pix(list(zip(data[ra2], data[dec2])), 1)
+    cat_xy = da.from_array(
+        imwcs.all_world2pix(list(zip(data[ra1], data[dec1])), 1),
+        chunks=(100, 2)
+    )
+    # cat_xy = imwcs.all_world2pix(list(zip(data[ra1], data[dec1])), 1)
+    logger.debug(f"Formed cat_xy array: {cat_xy.shape=}")
+
+    ref_xy = da.from_array(
+        imwcs.all_world2pix(list(zip(data[ra2], data[dec2])), 1),
+        chunks=(100, 2)
+    )
+    # ref_xy = imwcs.all_world2pix(list(zip(data[ra2], data[dec2])), 1)
+    logger.debug(f"Formed ref_xy array: {ref_xy.shape=}")
 
     diff_xy = ref_xy - cat_xy
+    logger.debug(f"Formed diff_xy array: {diff_xy.shape}")
+    logger.debug(f"{diff_xy}")
 
     global dxmodel
     dxmodel = interpolate.Rbf(
@@ -231,122 +292,13 @@ def apply_interp(index, x1, y1, x2, y2, data):
     return index, newdata
 
 
-def pool_fit_dxmodel(index, x, y):
-    off = dxmodel(x, y)
-    return index, off
-
-
-def pool_fit_dymodel(index, x, y):
-    off = dymodel(x, y)
-    return index, off
-
-
-def _fmm(args):
-    """
-    A shallow wrapper for apply_interp
-
-    Parameters
-    ----------
-    args : list
-        A list of arguments for apply_interp
-
-    Returns
-    -------
-    None
-    """
-    # an easier to debug traceback when multiprocessing
-    # thanks to https://stackoverflow.com/a/16618842/1710603
-    try:
-        return apply_interp(*args)
-    except:
-        import traceback
-
-        raise Exception("".join(traceback.format_exception(*sys.exc_info())))
-
-
-def _fmx(args):
-    """
-    A shallow wrapper for pool_fit_dxmodel
-
-    Parameters
-    ----------
-    args : list
-        A list of arguments for pool_fit_dxmodel
-
-    Returns
-    -------
-    None
-    """
-    # an easier to debug traceback when multiprocessing
-    # thanks to https://stackoverflow.com/a/16618842/1710603
-    try:
-        return pool_fit_dxmodel(*args)
-    except:
-        import traceback
-
-        raise Exception("".join(traceback.format_exception(*sys.exc_info())))
-
-
-def _fmy(args):
-    """
-    A shallow wrapper for pool_fit_dymodel
-
-    Parameters
-    ----------
-    args : list
-        A list of arguments for pool_fit_dymodel
-
-    Returns
-    -------
-    None
-    """
-    # an easier to debug traceback when multiprocessing
-    # thanks to https://stackoverflow.com/a/16618842/1710603
-    try:
-        return pool_fit_dymodel(*args)
-    except:
-        import traceback
-
-        raise Exception("".join(traceback.format_exception(*sys.exc_info())))
-
-
-def multiprocess_progress(cores, func, args, progress, tqdm_desc=None):
-    """
-    Provide a single function to decide how to do the pool work submission,
-    and wrap with a progress bar if requested
-    """
-    # start a new process for each task
-    with multiprocessing.Pool(processes=cores, maxtasksperchild=24) as pool:
-        try:
-            if progress:
-                results = [
-                    i
-                    for i in tqdm(
-                        pool.imap(func, args, chunksize=1),
-                        total=len(args),
-                        desc=tqdm_desc,
-                    )
-                ]
-                sleep(4)  # might help with a join timeout error?
-            else:
-                logger.info(f"Running {tqdm_desc} stage.")
-                results = pool.map_async(func, args, chunksize=1).get(timeout=10000000)
-
-        except KeyboardInterrupt:
-            pool.close()
-            sys.exit(1)
-
-    return results
-
-
-def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=False):
+def correct_images(fnames, suffix, testimage=False, progress=False):
     """
     Read a list of fits image, and apply pixel-by-pixel corrections based on the
     given x/y models, which are global variables defined earlier.
     Interpolate back to a regular grid, and then write output files.
     :param fname: input fits file
     :param fout: output fits file
-    :param vm: Assume this many GBs are available, which is used when computing stride lengths
     :param progress: use tqdm to provide a progress bar
     :return: None
     """
@@ -356,152 +308,52 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
     nx = hdr["NAXIS1"]
     ny = hdr["NAXIS2"]
 
-    xy = np.indices((ny, nx), dtype=np.float32)
-    xy.shape = (2, nx * ny)
+    xy = da.indices((ny, nx), dtype=np.float32)
+    
+    xy = xy.reshape(2, -1)
+    logger.debug(f"{xy.shape=}, type: {type(xy)}")
 
-    x = np.array(xy[1, :])
-    y = np.array(xy[0, :])
+    stride = int(xy.shape[-1] * 0.01)
 
-    if vm is None:
-        mem = int(psutil.virtual_memory().available * 0.75)
-    else:
-        mem = int(vm * 1e9)  # GB to B
-    logger.info("Detected memory ~{0}GB".format(mem / 2**30))
-    # 32-bit floats, bit to byte conversion, MB conversion
-    logger.info("Image is {0}MB".format(nx * ny * 32 / (8 * 2**20)))
-    pixmem = 20000
-    logger.info("Allowing {0}kB per pixel".format(pixmem / 2**10))
-    stride = mem / pixmem
-    # Make sure stride is row-divisible
-    stride = (stride // ny) * ny
-    # Generally if this is true, the images are so small that you don't want to waste
-    # system time setting up a big complex operation
-    if len(x) < stride:
-        logger.info("Calculating all pixel offsets at once.")
-        x += dxmodel(x, y)
-        y += dymodel(xy[1, :], y)
-    else:
-        if cores == 1:
-            logger.info(
-                "Applying corrections to pixel co-ordinates {0} rows at a time, using a single core".format(
-                    stride // ny
-                )
-            )
-            n = 0
-            borders = list(range(0, len(x) + 1, int(stride)))
-            if borders[-1] != len(x):
-                borders.append(len(x))
-            for s1 in [slice(a, b) for a, b in zip(borders[:-1], borders[1:])]:
-                off = dxmodel(x[s1], y[s1])
-                x[s1] += off
-                # the x coords were just changed so we need to refer back to the original coords
-                off = dymodel(xy[1, :][s1], y[s1])
-                y[s1] += off
-                n += 1
-                sys.stdout.write("{0:3.0f}%...".format(100 * n / len(borders)))
-                sys.stdout.flush()
-            logger.info("")
-        else:
-            # Ensure each core gets enough memory
-            stride /= cores
+    logger.info(f"Chunking into dask array, {stride=}")
+    x = da.rechunk(xy[1, :], chunks=(stride,))
+    y = da.rechunk(xy[0, :], chunks=(stride, ))
+    
+    logger.info(f"{x}")
+    logger.info(f"{y}")
+    
+    x = x + dxmodel(x, y)
 
-            # When using a pool, you need to send the arguments as a tuple through the
-            # wrapping function, so we set up the arguments here before running the pool
-            args = []
-            logger.info(
-                "Applying corrections to pixel co-ordinates {0} rows at a time across {1} cores".format(
-                    stride // ny, cores
-                )
-            )
-            borders = list(range(0, len(x) + 1, int(stride)))
-            if borders[-1] != len(x):
-                borders.append(len(x))
-            # We need to order our arguments by an index, since the results will be returned
-            # in whatever order the pooled tasks finish
-            n = 0
-            for s1 in [slice(a, b) for a, b in zip(borders[:-1], borders[1:])]:
-                args.append((n, xy[1, s1], y[s1]))
-                n += 1
 
-            # x-offsets first
-            results = multiprocess_progress(
-                cores, _fmx, args, progress, tqdm_desc="x-offsets"
-            )
-
-            logger.info("Reordering x-offset results")
-            indices, offsets = map(list, zip(*results))
-            # Order correctly
-            ind = np.argsort(indices)
-            offsets = np.array(offsets, dtype="object")
-            offsets = offsets[ind]
-            # Flatten list of lists
-            o = [item for sublist in offsets for item in sublist]
-
-            # o = np.concatenate([sublist for sublist in offsets])
-            # Make into array and apply
-            x += np.array(o)
-
-            # y-offsets are performed now
-            results = multiprocess_progress(
-                cores, _fmy, args, progress, tqdm_desc="y-offsets"
-            )
-
-            logger.info("Reordering y-offset results")
-            indices, offsets = map(list, zip(*results))
-            # Order correctly
-            ind = np.argsort(indices)
-            offsets = np.array(offsets, dtype="object")
-            offsets = offsets[ind]
-            # Flatten list of lists
-            o = [item for sublist in offsets for item in sublist]
-            # Make into array and apply
-            y += np.array(o)
-
+    logger.info("Calculating all x-pixel offsets at once.")
+    logger.debug(f"x-coord array shape is: {x.shape=}")
+    stride = int(x.shape[0] * 0.05)
+    idx = 0
+    while idx * stride < x.shape[0]:
+        slice_x = slice(idx*stride, (idx+1)*stride)
+        logger.debug(f"{idx=} Formed x-slice: {slice_x=}")
+        
+        x[slice_x] += dxmodel(x[slice_x], y[slice_x])
+        idx += 1
+    
+    
+    logger.info("Calculating all y-pixel offsets at once.")
+    y += dymodel(xy[1, :], y)
+    
     if testimage is True:
-        logger.info("Creating divergence maps")
-        start = time()
-        # Save the divergence as a fits image
-        im = fits.open(fnames[0])
-        outputname = fnames[0].replace(".fits", "")
-        div = (
-            np.gradient((x - np.array(xy[1, :])).reshape((nx, ny)))[0]
-            + np.gradient((y - np.array(xy[0, :])).reshape((nx, ny)))[1]
-        )
-        im[0].data = div
-        im.writeto(outputname + "_div.fits", overwrite=True)
-        im[0].data = (x - np.array(xy[1, :])).reshape((nx, ny))
-        im.writeto(outputname + "_delx.fits", overwrite=True)
-        im[0].data = (y - np.array(xy[0, :])).reshape((nx, ny))
-        im.writeto(outputname + "_dely.fits", overwrite=True)
-        logger.info("finished divergence map in {0} seconds".format(time() - start))
-
-        del im
-
-    # Note that a potential speed-up would be to nest the file loop inside the
-    # model calculation loop, so you don't have to calculate the model so many times
-    # However this would require either:
-    # 1) holding all the files in memory; but the model calculation is done in a loop
-    #    in order to reduce memory use, so this would be counter-productive; or:
-    # 2) writing out partly-complete FITS files and then reading them back in again,
-    #    which is a bit messy and so has not yet been implemented.
+        create_divergence_map(fnames, xy, x, y, nx, ny)
+    
     # Fancy splines need about this amount of buffer in order to interpolate the data
     # if = 5, differences ~ 10^-6 Jy/beam ; if = 15, differences ~ 10^-9; if = 25, 0
+    
     extra_lines = 25
-    #    extra_lines = int(max(maxx, maxy)) + 1
-    # Testing shows that this stage is less memory intensive, and we can do more
-    # rows per cycle. For a single core there is little speed-up from processing with fewer
-    # rows, so if needed this number can be decreased by factors of 1-10 with no ill
-    # effect on processing time.
-    # However, for multi-core processing we want this number as large as possible
-    # without going OOM.
-    stride *= 40
-
+    
     for fname in fnames:
         fout = fname.replace(".fits", "_" + suffix + ".fits")
         im = fits.open(fname)
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
         oldshape = im[0].data.shape
-        data = im[0].data
+        data = da.array(im[0].data)
         unsqueezedshape = data.shape
         data = np.squeeze(data)
         squeezedshape = data.shape
@@ -509,101 +361,14 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
         nandices = np.isnan(data)
         data[nandices] = 0.0
         logger.info("interpolating {0}".format(fname))
-        # We have the "all at once" option inside the cores=1 option this time, because
-        # even on a high-memory system, it is faster to parallelise the interpolation than
-        # to rely on scipy to do it all at once
-        if cores == 1:
-            if len(x) > stride:
-                logger.info(
-                    "Interpolating {0} rows at a time using a single core".format(
-                        stride // data.shape[0]
-                    )
-                )
-                # We need a fresh copy of the data because otherwise we will be trying to
-                # interpolate over the results of our interpolation
-                newdata = np.copy(data)
-                logger.info("Remapping data")
-                n = 0
-                logger.info(f"Stride is {stride}")
-                borders = list(range(0, len(x) + 1, int(stride)))
-                if borders[-1] != len(x):
-                    borders.append(len(x))
-                for a, b in zip(borders, borders[1:]):
-                    # indexes into the image based on the index into the raveled data
-                    idx = np.unravel_index(range(a, b), data.shape)
-                    # model using an extra few lines to avoid edge effects
-                    bp = min(b + data.shape[0] * extra_lines, len(x))
-                    # also go backwards by a few lines
-                    ap = max(0, a - data.shape[0] * extra_lines)
-                    idxp = np.unravel_index(range(ap, bp), data.shape)
-                    model = CloughTocher2DInterpolator(
-                        np.transpose([x[ap:bp], y[ap:bp]]),
-                        np.ravel(data[idxp]),
-                        fill_value=-1,
-                    )
-                    # evaluate the model over this range
-                    newdata[idx] = model(xy[1, a:b], xy[0, a:b])
-                    n += 1
-                    sys.stdout.write("{0:3.0f}%...".format(100 * n / len(borders)))
-                    sys.stdout.flush()
-                logger.info("")
-                # Float32 instead of Float64 since the precision is meaningless
-                logger.info("int64 -> int32")
-                data = np.float32(newdata)
-            else:
-                logger.info("all at once")
-                model = CloughTocher2DInterpolator(np.transpose([x, y]), np.ravel(data))
-                newdata = model(xy[1, :], xy[0, :])
-                # Float32 instead of Float64 since the precision is meaningless
-                logger.info("int64 -> int32")
-                data = np.float32(newdata)
-        else:
-            # Testing shows that larger strides go OOM for the parallel version
-            stride /= 8
-            # Make sure it is row-divisible
-            stride = (stride // ny) * ny
-            logger.info(
-                "Interpolating {0} rows at a time across {1} cores".format(
-                    stride // ny, cores
-                )
-            )
-            args = []
-            n = 0
-            borders = list(range(0, len(x) + 1, int(stride)))
-            if borders[-1] != len(x):
-                borders.append(len(x))
 
-            logger.info("Building segmented image set")
-            for a, b in zip(borders, borders[1:]):
-                # indexes into the image based on the index into the raveled data
-                idx = np.unravel_index(range(a, b), data.shape)
-                # model using an extra few lines to avoid edge effects
-                bp = min(b + data.shape[0] * extra_lines, len(x))
-                # also go backwards by a few lines
-                ap = max(0, a - data.shape[0] * extra_lines)
-                idxp = np.unravel_index(range(ap, bp), data.shape)
-                #                # evaluate the model over this range
-                #                calc(x1 = x[ap:bp], y1 = y[ap:bp], data = data[idxp], x2 = xy[1, a:b], y2 = xy[0, a:b])
-                args.append((n, x[ap:bp], y[ap:bp], xy[1, a:b], xy[0, a:b], data[idxp]))
-                n += 1
-                logger.debug(n)
-
-            # start a new process for each task
-            results = multiprocess_progress(
-                cores, _fmm, args, progress, tqdm_desc="Sky interpolation"
-            )
-
-            indices, pixvals = map(list, zip(*results))
-            # Order correctly
-            ind = np.argsort(indices)
-            pixvals = np.array(pixvals, dtype="object")
-            pixvals = pixvals[ind]
-            # Flatten list of lists
-            n = [item for sublist in pixvals for item in sublist]
-            # Float32 instead of Float64 since the precision is meaningless
-            logger.info("int64 -> int32")
-            newdata = np.array(n, dtype="float32")
-
+        logger.info("all at once")
+        model = CloughTocher2DInterpolator(np.transpose([x, y]), np.ravel(data))
+        newdata = model(xy[1, :], xy[0, :])
+        # Float32 instead of Float64 since the precision is meaningless
+        logger.info("int64 -> int32")
+        data = newdata.astype(np.float32)
+    
         data = newdata.reshape(squeezedshape)
         # NaN the edges by 10 pixels to avoid weird edge effects
         logger.info("blanking edges")
@@ -611,6 +376,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
         data[:, 0:10] = np.nan
         data[:, -10 : data.shape[0]] = np.nan
         data[-10 : data.shape[1], :] = np.nan
+        
         # Re-apply any previous NaN mask to the data
         data[nandices] = np.nan
         im[0].data = data.reshape(oldshape)
@@ -619,6 +385,7 @@ def correct_images(fnames, suffix, testimage=False, cores=1, vm=None, progress=F
         logger.info("wrote {0}".format(fout))
         # Explicitly delete potential memory hogs
         del im, data
+    
     return
 
 
@@ -770,7 +537,7 @@ if __name__ == "__main__":
     group1.add_argument(
         "--xm",
         dest="xm",
-        type=str,
+        type=Path,
         default=None,
         help="A .fits binary or VO table. The crossmatch between the reference and source catalogue.",
     )
@@ -826,13 +593,6 @@ if __name__ == "__main__":
         help="Plot the offsets and models (default = False)",
     )
     group3.add_argument(
-        "--latex",
-        dest="latex",
-        default=False,
-        action="store_true",
-        help="Use LaTeX to make nicer axis labels for plots (default = False)",
-    )
-    group3.add_argument(
         "--testimage",
         dest="testimage",
         default=False,
@@ -868,19 +628,6 @@ if __name__ == "__main__":
         help="Signal-to-noise ratio for a signal-to-noise cut (default = 10)",
     )
     group3.add_argument(
-        "--cores",
-        dest="cores",
-        default=None,
-        type=int,
-        help="NUmber of cores to use (default = autodetect",
-    )
-    group3.add_argument(
-        "--vm",
-        default=None,
-        type=float,
-        help="Attempt to restrict interpolation algorithms to this man GBs. Data is split based on a stride length computed internally. ",
-    )
-    group3.add_argument(
         "--nsrcs",
         default=None,
         type=int,
@@ -899,7 +646,7 @@ if __name__ == "__main__":
         help="Provide a progress bar for stages that are distributed into work-units",
     )
     group3.add_argument(
-        "--verbose",
+        "-v", "--verbose",
         default=False,
         action="store_true",
         help="Provide extra logging throughout the procedure",
@@ -953,35 +700,9 @@ if __name__ == "__main__":
 
     if results.cite is True:
         logger.info(
-            """
-Thanks for using fits_warp! To cite this package, please use the following BibTeX:
-
-                @ARTICLE{2018A&C....25...94H,
-                   author = {{Hurley-Walker}, N. and {Hancock}, P.~J.},
-                    title = \"{De-distorting ionospheric effects in the image plane}\",
-                  journal = {Astronomy and Computing},
-                archivePrefix = \"arXiv\",
-                   elogger.info = {1808.08017},
-                 primaryClass = \"astro-ph.IM\",
-                 keywords = {Astrometry, Radio astronomy, Algorithms, Ionosphere},
-                     year = 2018,
-                    month = oct,
-                   volume = 25,
-                    pages = {94-102},
-                      doi = {10.1016/j.ascom.2018.08.006},
-                   adsurl = {http://adsabs.harvard.edu/abs/2018A%26C....25...94H},
-                  adsnote = {Provided by the SAO/NASA Astrophysics Data System}
-                }
-
-Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25...94H
-"""
+            __doc__
         )
         sys.exit()
-
-    if results.cores is None:
-        cores = multiprocessing.cpu_count()
-    else:
-        cores = results.cores
 
     if results.incat is not None:
         if results.refcat is not None:
@@ -1021,7 +742,6 @@ Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25..
                 results.sigcol,
                 results.noisecol,
                 results.SNR,
-                results.latex,
                 max_sources=results.nsrcs,
             )
             if results.suffix is not None:
@@ -1029,8 +749,6 @@ Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25..
                     fnames,
                     results.suffix,
                     results.testimage,
-                    cores,
-                    vm=results.vm,
                     progress=results.progress,
                 )
             else:
