@@ -289,11 +289,8 @@ def derive_apply_Clough(offset_x: Array, offset_y: Array, data: Array,
     offset_xy = np.array([
         offset_y, offset_x]
     )
-    logger.info("Inside derive and apply")
-    logger.info(f"{offset_x.shape=}")
-    logger.info(f"{offset_y.shape=}")
-    logger.info(f"{data.shape=}")
     
+    # there must be a meta keyword to set the return type
     if data.shape[0] == 0:
         logger.info("I be returning a 0")
         return np.zeros_like(data)
@@ -334,7 +331,7 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
     
     logger.info(xy)
 
-    x = da.blockwise(
+    delta_x = da.blockwise(
         offset_x_model,
         'jk', 
         xy[1,:,:],
@@ -344,9 +341,9 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
         dtype=np.float32
     )
 
-    logger.info(x)
+    logger.info(delta_x)
     
-    y = da.blockwise(
+    delta_y = da.blockwise(
         offset_y_model,
         'jk', 
         xy[1,:,:],
@@ -356,13 +353,13 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
         dtype=np.float32
     )
     
-    logger.info(y)
+    logger.info(delta_y)
     
     logger.info(f"Computing new x-coordinates")
-    x = x + x.compute()
+    x = xy[1, :, :] + delta_x.compute()
     
     logger.info(f"Computing new y-coordinates")
-    y = y + y.compute()
+    y = xy[0, :, :] + delta_y.compute()
     
     fig, ax1 = plt.subplots(1,1)
     
@@ -393,7 +390,8 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
         oldshape = im[0].data.shape
         data = im[0].data
-        data[~np.isfinite(data)] = 0.0
+        finite_mask = np.isfinite(data)
+        data[~finite_mask] = 0.0
         data = da.array(data)
         
         data = da.squeeze(data)
@@ -451,7 +449,6 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
         logger.info(f"{reference_x=}")
         logger.info(f"{reference_y=}")
         
-        
         models = da.map_overlap(
             derive_apply_Clough,
             offset_x, 
@@ -461,17 +458,24 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
             reference_y,
             dtype=np.float32,
             align_arrays=True,
-            allow_rechunk=True            
+            allow_rechunk=True,
+            depth=50,
+            boundary='nearest'          
         )
+        
         logger.info(f"{models}")
         logger.info(f"About to recompute")
         newdata = models.compute()
+        
+        logger.info(f"Compute finished: {newdata}")
         
         # Float32 instead of Float64 since the precision is meaningless
         logger.info("int64 -> int32")
         data = newdata.astype(np.float32)
     
         data = newdata.reshape(squeezedshape)
+        logger.info(f"{data=}")
+        
         # NaN the edges by 10 pixels to avoid weird edge effects
         logger.info("blanking edges")
         data[0:10, :] = np.nan
@@ -480,14 +484,14 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
         data[-10 : data.shape[1], :] = np.nan
         
         # Re-apply any previous NaN mask to the data
-        data[nandices] = np.nan
-        im[0].data = data.reshape(oldshape)
+        data = data.reshape(oldshape)
+        data[~finite_mask] = np.nan
+        im[0].data = data
+        
         logger.info("saving...")
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
         logger.info("wrote {0}".format(fout))
-        # Explicitly delete potential memory hogs
-        del im, data
-    
+        
     return
 
 
