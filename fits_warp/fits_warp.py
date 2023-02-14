@@ -359,23 +359,28 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
     logger.info(y)
     
     logger.info(f"Computing new x-coordinates")
-    x = x.compute()
-    logger.info(f"Finished x coordinates")
+    x = x + x.compute()
     
     logger.info(f"Computing new y-coordinates")
-    y = y.compute()
-    logger.info("Finished y coordinates")
+    y = y + y.compute()
     
-    fig, (ax1, ax2) = plt.subplots(1,2)
+    fig, ax1 = plt.subplots(1,1)
     
-    ax1.imshow(
+    cim = ax1.imshow(
         x
     )
-    ax2.imshow(
-        y
-    )
+    fig.colorbar(cim)
     fig.tight_layout()
     fig.savefig('example_x.pdf')
+    
+    fig, ax1 = plt.subplots(1,1)
+    
+    cim = ax1.imshow(
+        y
+    )
+    fig.colorbar(cim)
+    fig.tight_layout()
+    fig.savefig('example_y.pdf')
     
     if testimage is True:
         create_divergence_map(fnames, xy, x, y, nx, ny)
@@ -387,14 +392,16 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
         im = fits.open(fname)
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
         oldshape = im[0].data.shape
-        data = da.array(im[0].data)
-        unsqueezedshape = data.shape
+        data = im[0].data
+        data[~np.isfinite(data)] = 0.0
+        data = da.array(data)
+        
         data = da.squeeze(data)
         squeezedshape = data.shape
         
         # Replace NaNs with zeroes because otherwise it breaks the interpolation
         nandices = da.isnan(data)
-        data[nandices] = 0.0
+        
         logger.info(f"interpolating {fname}")
         logger.debug(f"data shape {data.shape=}")
         logger.info(f"{data}")
