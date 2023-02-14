@@ -284,6 +284,34 @@ def apply_interp(index, x1, y1, x2, y2, data):
     return index, newdata
 
 
+def derive_apply_Clough(offset_x: Array, offset_y: Array, data: Array,
+                        reference_x: Array, reference_y: Array) -> Array:
+    offset_xy = np.array([
+        offset_y, offset_x]
+    )
+    logger.info("Inside derive and apply")
+    logger.info(f"{offset_x.shape=}")
+    logger.info(f"{offset_y.shape=}")
+    logger.info(f"{data.shape=}")
+    
+    if data.shape[0] == 0:
+        logger.info("I be returning a 0")
+        return np.zeros_like(data)
+    
+    model = CloughTocher2DInterpolator(
+            offset_xy.T,
+            data
+    )
+    
+    return model(
+        np.array(
+            [reference_y,
+            reference_x]
+        ).T
+    )
+    
+    
+
 def correct_images(fnames, suffix, testimage=False, progress=False):
     """
     Read a list of fits image, and apply pixel-by-pixel corrections based on the
@@ -378,6 +406,15 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
             ),
             (-1, 2)
         )
+        offset_x = da.reshape(
+            da.asarray(x),
+            (-1,)
+        )
+        offset_y = da.reshape(
+            da.asarray(y),
+            (-1,)
+        )
+        
         logger.debug(f"Transpose xy: {t_xy.shape=}")
         logger.debug(f"{t_xy}")
         
@@ -389,22 +426,39 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
         logger.debug(f"{ravel_data=}")
         
         logger.info("all at once")
-        # model = CloughTocher2DInterpolator(t_xy, ravel_data)
+        logger.info(f"{xy=}")
+        
+        reference_x = da.reshape(
+            xy[1,:,:],
+            (-1, )
+        )
+
+        reference_y = da.reshape(
+            xy[0,:,:],
+            (-1, )
+        )
+
+        logger.info(f"{offset_x=}")
+        logger.info(f"{offset_y=}")
+        logger.info(f"{ravel_data=}")
+        logger.info(f"{reference_x=}")
+        logger.info(f"{reference_y=}")
+        
+        
         models = da.map_overlap(
-            CloughTocher2DInterpolator,
-            t_xy,
+            derive_apply_Clough,
+            offset_x, 
+            offset_y,
             ravel_data, 
+            reference_x, 
+            reference_y,
             dtype=np.float32,
-            allow_rechunk=True,
-            align_arrays=True            
+            align_arrays=True,
+            allow_rechunk=True            
         )
         logger.info(f"{models}")
-        
-        models = models.compute()
-        return
-        
-        logger.info("Model createdm evaluating")
-        newdata = model(xy[1, :], xy[0, :])
+        logger.info(f"About to recompute")
+        newdata = models.compute()
         
         # Float32 instead of Float64 since the precision is meaningless
         logger.info("int64 -> int32")
