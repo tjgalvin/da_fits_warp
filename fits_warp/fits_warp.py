@@ -41,7 +41,6 @@ import astropy.units as u
 import dask.array as da
 import matplotlib.pyplot as plt
 import numpy as np
-import psutil
 from astropy import wcs
 from astropy.coordinates import SkyCoord, SkyOffsetFrame
 from astropy.io import fits
@@ -53,6 +52,8 @@ from matplotlib import gridspec, pyplot
 from scipy import interpolate
 from scipy.interpolate import CloughTocher2DInterpolator
 from tqdm import tqdm
+
+from dask.distributed import Client, LocalCluster
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(module)s:%(levelname)s:%(lineno)d %(message)s")
@@ -250,24 +251,23 @@ def make_pix_models(
 
     start = time()
 
-    cat_xy = da.from_array(
-        imwcs.all_world2pix(list(zip(data[ra1], data[dec1])), 1),
-        chunks=(100, 2)
-    )
-    # cat_xy = imwcs.all_world2pix(list(zip(data[ra1], data[dec1])), 1)
+    # cat_xy = da.from_array(
+    #     imwcs.all_world2pix(list(zip(data[ra1], data[dec1])), 1),
+    #     chunks=(100, 2)
+    # )
+    cat_xy = imwcs.all_world2pix(np.asarray(list(zip(data[ra1], data[dec1]))), 1)
     logger.debug(f"Formed cat_xy array: {cat_xy.shape=}")
 
-    ref_xy = da.from_array(
-        imwcs.all_world2pix(list(zip(data[ra2], data[dec2])), 1),
-        chunks=(100, 2)
-    )
-    # ref_xy = imwcs.all_world2pix(list(zip(data[ra2], data[dec2])), 1)
+    # ref_xy = da.from_array(
+    #     imwcs.all_world2pix(list(zip(data[ra2], data[dec2])), 1),
+    #     chunks=(100, 2)
+    # )
+    ref_xy = imwcs.all_world2pix(np.asarray(list(zip(data[ra2], data[dec2]))), 1)
     logger.debug(f"Formed ref_xy array: {ref_xy.shape=}")
 
     diff_xy = ref_xy - cat_xy
     logger.debug(f"Formed diff_xy array: {diff_xy.shape}")
-    logger.debug(f"{diff_xy}")
-
+    
     global dxmodel
     dxmodel = interpolate.Rbf(
         cat_xy[:, 0], cat_xy[:, 1], diff_xy[:, 0], function="linear", smooth=smooth
@@ -308,45 +308,59 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
     nx = hdr["NAXIS1"]
     ny = hdr["NAXIS2"]
 
-    xy = da.indices((ny, nx), dtype=np.float32)
+    xy = da.indices((ny, nx), dtype=np.float32, chunks=(500, 500))
     
-    xy = xy.reshape(2, -1)
     logger.debug(f"{xy.shape=}, type: {type(xy)}")
-
-    stride = int(xy.shape[-1] * 0.01)
-
-    logger.info(f"Chunking into dask array, {stride=}")
-    x = da.rechunk(xy[1, :], chunks=(stride,))
-    y = da.rechunk(xy[0, :], chunks=(stride, ))
     
-    logger.info(f"{x}")
-    logger.info(f"{y}")
-    
-    x = x + dxmodel(x, y)
+    logger.info(xy)
 
+    x = da.blockwise(
+        dxmodel,
+        'jk', 
+        xy[1,:,:],
+        'jk',
+        xy[0,:,:],
+        'jk',
+        dtype=np.float32
+    )
 
-    logger.info("Calculating all x-pixel offsets at once.")
-    logger.debug(f"x-coord array shape is: {x.shape=}")
-    stride = int(x.shape[0] * 0.05)
-    idx = 0
-    while idx * stride < x.shape[0]:
-        slice_x = slice(idx*stride, (idx+1)*stride)
-        logger.debug(f"{idx=} Formed x-slice: {slice_x=}")
-        
-        x[slice_x] += dxmodel(x[slice_x], y[slice_x])
-        idx += 1
+    logger.info(x)
     
+    y = da.blockwise(
+        dymodel,
+        'jk', 
+        xy[1,:,:],
+        'jk',
+        xy[0,:,:],
+        'jk',
+        dtype=np.float32
+    )
     
-    logger.info("Calculating all y-pixel offsets at once.")
-    y += dymodel(xy[1, :], y)
+    logger.info(y)
+    
+    logger.info(f"Computing new x-coordinates")
+    x = x.compute()
+    logger.info(f"Finished x coordinates")
+    
+    logger.info(f"Computing new y-coordinates")
+    y = y.compute()
+    logger.info("Finished y coordinates")
+    
+    fig, (ax1, ax2) = plt.subplots(1,2)
+    
+    ax1.imshow(
+        x
+    )
+    ax2.imshow(
+        y
+    )
+    fig.tight_layout()
+    fig.savefig('example_x.pdf')
     
     if testimage is True:
         create_divergence_map(fnames, xy, x, y, nx, ny)
     
-    # Fancy splines need about this amount of buffer in order to interpolate the data
-    # if = 5, differences ~ 10^-6 Jy/beam ; if = 15, differences ~ 10^-9; if = 25, 0
-    
-    extra_lines = 25
+    # return
     
     for fname in fnames:
         fout = fname.replace(".fits", "_" + suffix + ".fits")
@@ -355,16 +369,51 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
         oldshape = im[0].data.shape
         data = da.array(im[0].data)
         unsqueezedshape = data.shape
-        data = np.squeeze(data)
+        data = da.squeeze(data)
         squeezedshape = data.shape
+        
         # Replace NaNs with zeroes because otherwise it breaks the interpolation
-        nandices = np.isnan(data)
+        nandices = da.isnan(data)
         data[nandices] = 0.0
-        logger.info("interpolating {0}".format(fname))
-
+        logger.info(f"interpolating {fname}")
+        logger.debug(f"data shape {data.shape=}")
+        logger.info(f"{data}")
+    
+        logger.debug(f"Rechunking positions")
+        t_xy = da.reshape(
+            da.transpose(
+                da.array([x,y])
+            ),
+            (-1, 2)
+        )
+        logger.debug(f"Transpose xy: {t_xy.shape=}")
+        logger.debug(f"{t_xy}")
+        
+        logger.debug(f"Rechunking ravel data")
+        ravel_data = da.rechunk(
+            np.ravel(data),
+            chunks='auto'
+        )
+        logger.debug(f"{ravel_data=}")
+        
         logger.info("all at once")
-        model = CloughTocher2DInterpolator(np.transpose([x, y]), np.ravel(data))
+        # model = CloughTocher2DInterpolator(t_xy, ravel_data)
+        models = da.map_overlap(
+            CloughTocher2DInterpolator,
+            t_xy,
+            ravel_data, 
+            dtype=np.float32,
+            allow_rechunk=True,
+            align_arrays=True            
+        )
+        logger.info(f"{models}")
+        
+        models = models.compute()
+        return
+        
+        logger.info("Model createdm evaluating")
         newdata = model(xy[1, :], xy[0, :])
+        
         # Float32 instead of Float64 since the precision is meaningless
         logger.info("int64 -> int32")
         data = newdata.astype(np.float32)
@@ -728,33 +777,35 @@ if __name__ == "__main__":
 
     if results.infits is not None:
         if results.xm is not None:
-            fnames = glob.glob(results.infits)
-            # Use the first image to define the model
-            make_pix_models(
-                results.xm,
-                results.ra1,
-                results.dec1,
-                results.ra2,
-                results.dec2,
-                fnames[0],
-                results.plot,
-                results.smooth,
-                results.sigcol,
-                results.noisecol,
-                results.SNR,
-                max_sources=results.nsrcs,
-            )
-            if results.suffix is not None:
-                correct_images(
-                    fnames,
-                    results.suffix,
-                    results.testimage,
-                    progress=results.progress,
+            cluster = LocalCluster(n_workers=8, threads_per_worker=1)  # Launches a scheduler and workers locally
+            with Client(cluster) as client:  # Connect to distributed cluster and override default
+                fnames = glob.glob(results.infits)
+                # Use the first image to define the model
+                make_pix_models(
+                    results.xm,
+                    results.ra1,
+                    results.dec1,
+                    results.ra2,
+                    results.dec2,
+                    fnames[0],
+                    results.plot,
+                    results.smooth,
+                    results.sigcol,
+                    results.noisecol,
+                    results.SNR,
+                    max_sources=results.nsrcs,
                 )
-            else:
-                logger.info(
-                    "No output fits file specified via --suffix; not doing warping"
-                )
+                if results.suffix is not None:
+                    correct_images(
+                        fnames,
+                        results.suffix,
+                        results.testimage,
+                        progress=results.progress,
+                    )
+                else:
+                    logger.info(
+                        "No output fits file specified via --suffix; not doing warping"
+                    )
         else:
             logger.info(
                 "Must specify a cross-matched catalogue via --xm to perform the warping."
