@@ -74,8 +74,8 @@ def make_source_plot(
     gx, gy = np.mgrid[
         xmin : xmax : (xmax - xmin) / 50.0, ymin : ymax : (ymax - ymin) / 50.0
     ]
-    mdx = dxmodel(np.ravel(gx), np.ravel(gy))
-    mdy = dymodel(np.ravel(gx), np.ravel(gy))
+    mdx = offset_x_model(np.ravel(gx), np.ravel(gy))
+    mdy = offset_y_model(np.ravel(gx), np.ravel(gy))
     x = cat_xy[:, 0]
     y = cat_xy[:, 1]
 
@@ -193,7 +193,7 @@ def make_pix_models(
     :param plots: True = Make plots
     :param smooth: smoothing radius (in pixels) for the RBF function
     :param max_sources: Maximum number of sources to include in the construction of the warping model (defaults to None, use all sources)
-    :return: (dxmodel, dymodel)
+    :return: (offset_x_model, offset_y_model)
     """
     file_extension = fname.suffix
     logger.debug(f"File extension of {fname} is {file_extension}.")
@@ -251,29 +251,21 @@ def make_pix_models(
 
     start = time()
 
-    # cat_xy = da.from_array(
-    #     imwcs.all_world2pix(list(zip(data[ra1], data[dec1])), 1),
-    #     chunks=(100, 2)
-    # )
     cat_xy = imwcs.all_world2pix(np.asarray(list(zip(data[ra1], data[dec1]))), 1)
     logger.debug(f"Formed cat_xy array: {cat_xy.shape=}")
 
-    # ref_xy = da.from_array(
-    #     imwcs.all_world2pix(list(zip(data[ra2], data[dec2])), 1),
-    #     chunks=(100, 2)
-    # )
     ref_xy = imwcs.all_world2pix(np.asarray(list(zip(data[ra2], data[dec2]))), 1)
     logger.debug(f"Formed ref_xy array: {ref_xy.shape=}")
 
     diff_xy = ref_xy - cat_xy
     logger.debug(f"Formed diff_xy array: {diff_xy.shape}")
     
-    global dxmodel
-    dxmodel = interpolate.Rbf(
+    global offset_x_model
+    offset_x_model = interpolate.Rbf(
         cat_xy[:, 0], cat_xy[:, 1], diff_xy[:, 0], function="linear", smooth=smooth
     )
-    global dymodel
-    dymodel = interpolate.Rbf(
+    global offset_y_model
+    offset_y_model = interpolate.Rbf(
         cat_xy[:, 0], cat_xy[:, 1], diff_xy[:, 1], function="linear", smooth=smooth
     )
 
@@ -315,7 +307,7 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
     logger.info(xy)
 
     x = da.blockwise(
-        dxmodel,
+        offset_x_model,
         'jk', 
         xy[1,:,:],
         'jk',
@@ -327,7 +319,7 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
     logger.info(x)
     
     y = da.blockwise(
-        dymodel,
+        offset_y_model,
         'jk', 
         xy[1,:,:],
         'jk',
