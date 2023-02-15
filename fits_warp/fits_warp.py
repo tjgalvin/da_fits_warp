@@ -339,7 +339,7 @@ def derive_apply_Clough(
 
 
 def correct_images(
-    offset_models: OffsetModel, fnames: list[str], suffix: str, testimage: bool=False, overlap_factor: float = 1.0
+    offset_models: OffsetModel, fnames: list[str], suffix: str, testimage: bool=False, overlap_factor: float = 2.
 ):
     """Given RBF-interpolator models and target images, dewarp them to remove positional
     shifts of sources
@@ -349,7 +349,7 @@ def correct_images(
         fnames (list[str]): Collection of fits images to correct. These should all have the same pixel coordinates and WCS
         suffix (str): String attached to the end of the file name (before extension)
         testimage (bool, optional): Whether to create a divergence map. Defaults to False.
-        overlap_factor (float, optional): Number of pixels for the interpolator to share between adjacent blocks. Too low and artefacts will be introduced. Defaults to 1.0.
+        overlap_factor (float, optional): Factor to determine number of pixels for the interpolator to share between adjacent blocks. Factor is multiplied against the length of the fastest moving axis. Too low and artefacts will be introduced. Defaults to 1.0.
     """
     # Get co-ordinate system from first image
     # Do not open images at this stage, to save memory
@@ -662,6 +662,12 @@ if __name__ == "__main__":
         help="Number of cores to instruct dask to use throughout processing",
     )
     group3.add_argument(
+        '--overlap-factor',
+        type=float,
+        default=2,
+        help="Factor mulptipled against size of fastest moving image axis to determine the number of pixels from neighbouring sub-blocks to include in image interpolation. To small and artefacts can be introduced. "
+    )
+    group3.add_argument(
         "--testimage",
         dest="testimage",
         default=False,
@@ -819,6 +825,7 @@ if __name__ == "__main__":
                         fnames,
                         results.suffix,
                         results.testimage,
+                        overlap_factor=results.overlap_factor
                     )
                 else:
                     logger.info(
