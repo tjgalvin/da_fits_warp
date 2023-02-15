@@ -287,7 +287,7 @@ def derive_apply_Clough(
 
     model = CloughTocher2DInterpolator(offset_xy.T, data)
 
-    return model(np.array([reference_y, reference_x]).T)
+    return model(np.array([reference_y, reference_x]).T).astype(np.float32)
 
 
 def correct_images(offset_models, fnames, suffix, testimage=False, overlap_factor: float=1.):
@@ -310,8 +310,6 @@ def correct_images(offset_models, fnames, suffix, testimage=False, overlap_facto
 
     logger.debug(f"{xy.shape=}, type: {type(xy)}")
 
-    logger.info(xy)
-
     delta_x = da.map_blocks(
         offset_models.dx, xy[1, :, :], xy[0, :, :], dtype=np.float32
     )
@@ -320,53 +318,42 @@ def correct_images(offset_models, fnames, suffix, testimage=False, overlap_facto
         offset_models.dy, xy[1, :, :], xy[0, :, :], dtype=np.float32
     )
 
-    logger.info(f"Computing new x-coordinates")
     x = xy[1, :, :] + delta_x
-    x = x.compute()
+    offset_x = da.reshape(x, (-1,))
 
-    logger.info(f"Computing new y-coordinates")
     y = xy[0, :, :] + delta_y
-    y = y.compute()
+    offset_y = da.reshape(y, (-1,))
 
     if testimage is True:
         create_divergence_map(fnames, xy, x, y, nx, ny)
 
-    offset_x = da.reshape(da.asarray(x), (-1,))
-    offset_y = da.reshape(da.asarray(y), (-1,))
-
     for fname in fnames:
         fout = fname.replace(".fits", "_" + suffix + ".fits")
+        logger.info(f"interpolating {fname}")
         im = fits.open(fname)
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
 
         data = im[0].data
         overlap_depth = int(data.shape[-1] * overlap_factor)
         logger.info(f"Overlapping fastest moving axis with {overlap_factor=}, setting {overlap_depth=}")
+        logger.info(f"Deriving initial pixel mask")
         finite_mask = np.isfinite(data)
         data[~finite_mask] = 0.0
 
-        data = da.array(data)
-        data = da.squeeze(data)
-
-        logger.info(f"interpolating {fname}")
-        logger.debug(f"data shape {data.shape=}")
-        
-        
-        logger.debug(f"Rechunking ravel data")
-        ravel_data = da.rechunk(np.ravel(data), chunks="auto")
-        logger.debug(f"{ravel_data=}")
-
-        logger.info("all at once")
-
+        data = da.squeeze(da.array(data))
+        ravel_data = da.ravel(data)       
         reference_x = da.reshape(xy[1, :, :], (-1,))
         reference_y = da.reshape(xy[0, :, :], (-1,))
 
-        logger.info(f"{offset_x=}")
-        logger.info(f"{offset_y=}")
-        logger.info(f"{ravel_data=}")
-        logger.info(f"{reference_x=}")
-        logger.info(f"{reference_y=}")
+        logger.debug(f"{offset_x=}")
+        logger.debug(f"{offset_y=}")
+        logger.debug(f"{ravel_data=}")
+        logger.debug(f"{reference_x=}")
+        logger.debug(f"{reference_y=}")
 
+        # appears as though map_overlap would prefer equal dimensions
+        # to inputs. Should be broadcast-able is arrays are different
+        # but yet to master
         warped_data = da.map_overlap(
             derive_apply_Clough,
             offset_x,
@@ -378,20 +365,17 @@ def correct_images(offset_models, fnames, suffix, testimage=False, overlap_facto
             align_arrays=True,
             allow_rechunk=True,
             depth=overlap_depth,
-            trim=True,
+            # trim=True,
             boundary="nearest",
-            meta=np.array(()),
+            meta=np.array((), dtype=np.float32),
         )
 
-        logger.info(f"{warped_data}")
+        logger.debug(f"{warped_data=}")
         logger.info(f"Dewarping image...")
         warped_data = warped_data.compute()
-
         logger.info(f"Dewarp finished!")
 
-        # Float32 instead of Float64 since the precision is meaningless
-        data = warped_data.astype(np.float32)
-
+        logger.info("Reshaping and reapplying pixel mask")
         warped_data = warped_data.reshape(im[0].data.shape)
         warped_data[~finite_mask] = np.nan
         
@@ -608,6 +592,12 @@ if __name__ == "__main__":
         help="Plot the offsets and models (default = False)",
     )
     group3.add_argument(
+        "-c", "--cores",
+        default=1,
+        type=int,
+        help="Number of cores to instruct dask to use throughout processing",
+    )
+    group3.add_argument(
         "--testimage",
         dest="testimage",
         default=False,
@@ -653,12 +643,6 @@ if __name__ == "__main__":
         default=None,
         type=int,
         help="An exception is raised if there are fewer than this many cross-matched sources located in the internal cross-match procedure. ",
-    )
-    group3.add_argument(
-        "--progress",
-        default=False,
-        action="store_true",
-        help="Provide a progress bar for stages that are distributed into work-units",
     )
     group3.add_argument(
         "-v",
@@ -743,7 +727,7 @@ if __name__ == "__main__":
     if results.infits is not None:
         if results.xm is not None:
             cluster = LocalCluster(
-                n_workers=8, threads_per_worker=1
+                n_workers=results.cores, threads_per_worker=1
             )  # Launches a scheduler and workers locally
 
             with Client(
