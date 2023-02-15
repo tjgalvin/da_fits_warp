@@ -31,10 +31,10 @@ import glob
 import logging
 import sys
 import warnings
+from collections import namedtuple
 from pathlib import Path
 from time import sleep, time
 from typing import Any, Optional, Union
-from collections import namedtuple
 
 import astropy.units as u
 import dask.array as da
@@ -47,12 +47,11 @@ from astropy.io.votable import parse_single_table
 from astropy.stats.circstats import circmean
 from astropy.table import Table, hstack
 from astropy.utils.exceptions import AstropyWarning
+from dask.distributed import Client, LocalCluster
 from matplotlib import gridspec, pyplot
 from scipy import interpolate
 from scipy.interpolate import CloughTocher2DInterpolator
 from tqdm import tqdm
-
-from dask.distributed import Client, LocalCluster
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(module)s:%(levelname)s:%(lineno)d %(message)s")
@@ -71,6 +70,17 @@ def make_source_plot(
     offset_models: OffsetModel,
     cmap: str = "hsv",
 ) -> None:
+    """Create a figure showing the cross-matched sources and their offsets, as 
+    well as the interpolated screen of offsets
+
+    Args:
+        fname (Path): Output file name of the figure
+        hdr (dict[str, Any]): Header of the fits file this figure represents the offset screen for
+        cat_xy (np.ndarray): Source positions in pixel space
+        diff_xy (np.ndarray): Offset of source positions in pixels
+        offset_models (OffsetModel): RBF-interpolation functions used to generate the screen
+        cmap (str, optional): Alternative colour map to use. Defaults to "hsv".
+    """
     xmin, xmax = 0, hdr["NAXIS1"]
     ymin, ymax = 0, hdr["NAXIS2"]
 
@@ -153,6 +163,17 @@ def make_source_plot(
 def create_divergence_map(
     fnames: list[Path], xy: Array, x: Array, y: Array, nx: int, ny: int
 ) -> None:
+    """Generate a divergence map of source offsets. This (appears) to be the 
+    sum of the gradients of offsets in both X and Y directions. 
+
+    Args:
+        fnames (list[Path]): Collection of fits images. The header of the first is used to generate the map. 
+        xy (Array): Pixel positions of sources in x and y. 
+        x (Array): Offset source positions in x direction
+        y (Array): Offset source positions in y direction
+        nx (int): Number of x pixels to reshape to
+        ny (int): Number of y pixels to reshape to
+    """
     logger.info("Creating divergence maps")
     start = time()
     # Save the divergence as a fits image
@@ -185,6 +206,29 @@ def make_pix_models(
     SNR: float = 10,
     max_sources: Optional[int] = None,
 ) -> OffsetModel:
+    """Identified offset sources and create pair of RBF interpolator models (in pixel units)
+    to shift positions by to effectively 'dewarp.;
+
+    Args:
+        fname (Path): Name of the crossed matched source table 
+        ra1 (str, optional): RA column of input catalogue 1. Defaults to "ra".
+        dec1 (str, optional): Dec column of input catalogue 1. Defaults to "dec".
+        ra2 (str, optional): RA column of reference catalogue. Defaults to "RAJ2000".
+        dec2 (str, optional): Dec column of reference catalogue. Defaults to "DEJ2000".
+        fitsname (Optional[Path], optional): Name of fits image to get WCS header from, which is used to convert to pixel coordinates. Defaults to None.
+        plots (bool, optional): Create the source offset plot. Defaults to False.
+        smooth (float, optional): Smoothing factor used by RBF-interpolator. Defaults to 300.0.
+        sigcol (Optional[str], optional): Name of column containing source brightness. Defaults to None.
+        noisecol (Optional[str], optional): Name of column containing noise level at source position. SNR may be derived if sigcol is also not None. Defaults to None.
+        SNR (float, optional): SNR cut applied to all sources. Defaults to 10.
+        max_sources (Optional[int], optional): Maximum number of sources to include in model. Reducing this improves performance at cost of screen accuracy. Defaults to None.
+
+    Raises:
+        ValueError: Issued when table of sources can not be opened
+
+    Returns:
+        OffsetModel: Pair of RBF interpolator models for x and y directions. 
+    """
     file_extension = fname.suffix
     logger.debug(f"File extension of {fname} is {file_extension}.")
 
@@ -267,15 +311,6 @@ def make_pix_models(
     return offset_models
 
 
-def apply_interp(index, x1, y1, x2, y2, data):
-    model = CloughTocher2DInterpolator(
-        np.transpose([x1, y1]), np.ravel(data), fill_value=-1
-    )
-    # evaluate the model over this range
-    newdata = model(x2, y2)
-    return index, newdata
-
-
 def derive_apply_Clough(
     offset_x: Array,
     offset_y: Array,
@@ -283,6 +318,19 @@ def derive_apply_Clough(
     reference_x: Array,
     reference_y: Array,
 ) -> Array:
+    """Create and evaluate a CloughTocher2DInterpolator function to shift image
+    pixels with. All inputs need to be the same length. 
+
+    Args:
+        offset_x (Array): The offset pixel x-coordinate frame (i.e. true + warped offsets)
+        offset_y (Array): The offset pixel y-coordinate frame (i.e. true + warped offsets)
+        data (Array): Pixel intensities corresponding to the warped pixels coordinates
+        reference_x (Array): Pixel x-coordinate to evaluate to obtain dewarped pixel values
+        reference_y (Array): Pixel y-coordinate to evaluate to obtain dewarped pixel values
+
+    Returns:
+        Array: True pixel values of the image after dewarping observed positions
+    """
     offset_xy = np.array([offset_y, offset_x])
 
     model = CloughTocher2DInterpolator(offset_xy.T, data)
@@ -290,15 +338,18 @@ def derive_apply_Clough(
     return model(np.array([reference_y, reference_x]).T).astype(np.float32)
 
 
-def correct_images(offset_models, fnames, suffix, testimage=False, overlap_factor: float=1.):
-    """
-    Read a list of fits image, and apply pixel-by-pixel corrections based on the
-    given x/y models, which are global variables defined earlier.
-    Interpolate back to a regular grid, and then write output files.
-    :param fname: input fits file
-    :param fout: output fits file
-    :param progress: use tqdm to provide a progress bar
-    :return: None
+def correct_images(
+    offset_models: OffsetModel, fnames: list[str], suffix: str, testimage: bool=False, overlap_factor: float = 1.0
+):
+    """Given RBF-interpolator models and target images, dewarp them to remove positional
+    shifts of sources
+
+    Args:
+        offset_models (OffsetModel): (dx, dy) rbf-interpolator models to shift pixels by
+        fnames (list[str]): Collection of fits images to correct. These should all have the same pixel coordinates and WCS
+        suffix (str): String attached to the end of the file name (before extension)
+        testimage (bool, optional): Whether to create a divergence map. Defaults to False.
+        overlap_factor (float, optional): Number of pixels for the interpolator to share between adjacent blocks. Too low and artefacts will be introduced. Defaults to 1.0.
     """
     # Get co-ordinate system from first image
     # Do not open images at this stage, to save memory
@@ -325,23 +376,27 @@ def correct_images(offset_models, fnames, suffix, testimage=False, overlap_facto
     offset_y = da.reshape(y, (-1,))
 
     if testimage is True:
-        create_divergence_map(fnames, xy, x, y, nx, ny)
+        logger.info(f"Creating divergence map.")
+        logger.info(f"Evaluating x- and y-coordinates for divergence map.")
+        create_divergence_map(fnames, xy, x.compute(), y.compute(), nx, ny)
 
     for fname in fnames:
         fout = fname.replace(".fits", "_" + suffix + ".fits")
-        logger.info(f"interpolating {fname}")
+        logger.info(f"Interpolating {fname}")
         im = fits.open(fname)
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
 
         data = im[0].data
         overlap_depth = int(data.shape[-1] * overlap_factor)
-        logger.info(f"Overlapping fastest moving axis with {overlap_factor=}, setting {overlap_depth=}")
-        logger.info(f"Deriving initial pixel mask")
+        logger.info(
+            f"Overlapping fastest moving axis with {overlap_factor=}, setting {overlap_depth=}"
+        )
+        logger.info(f"Deriving pixel mask")
         finite_mask = np.isfinite(data)
         data[~finite_mask] = 0.0
 
         data = da.squeeze(da.array(data))
-        ravel_data = da.ravel(data)       
+        ravel_data = da.ravel(data)
         reference_x = da.reshape(xy[1, :, :], (-1,))
         reference_y = da.reshape(xy[0, :, :], (-1,))
 
@@ -378,7 +433,7 @@ def correct_images(offset_models, fnames, suffix, testimage=False, overlap_facto
         logger.info("Reshaping and reapplying pixel mask")
         warped_data = warped_data.reshape(im[0].data.shape)
         warped_data[~finite_mask] = np.nan
-        
+
         im[0].data = warped_data
 
         logger.info("saving...")
@@ -389,29 +444,36 @@ def correct_images(offset_models, fnames, suffix, testimage=False, overlap_facto
 
 
 def warped_xmatch(
-    incat=None,
-    refcat=None,
-    ra1="ra",
-    dec1="dec",
-    ra2="RAJ2000",
-    dec2="DEJ2000",
-    radius=2 / 60.0,
-    enforce_min_srcs=None,
-):
-    """
-    Create a cross match solution between two catalogues that accounts for bulk shifts and image warping.
-    The warping is done in pixel coordinates, not sky coordinates.
+    incat: str,
+    refcat: str,
+    ra1: str="ra",
+    dec1: str="dec",
+    ra2: str="RAJ2000",
+    dec2: str="DEJ2000",
+    radius: float=2 / 60.0,
+    enforce_min_srcs: Optional[int]=None,
+) -> tuple[Table, Table]:
+    """Given two source catalogues, perform an iterative serch to cross-match sources. 
+    Successive rounds of cross-matching will refine an initial warp screen, which will
+    improve the reliability of the cross match. 
 
-    :param image: Fits image containing the WCS info for sky->pix conversion (Ideally the image which was used
-                  to create incat.
-    :param incat: The input catalogue which is to be warped during the cross matching process.
-    :param ref_cat: The reference image which will remain unwarped during the cross matching process
-    :param ra1, dec1: column names for ra/dec in the input catalogue
-    :param ra2, dec2: column names for ra/dec in the reference catalogue
-    :param radius: initial matching radius in degrees
-    :param enforce_min_sources: If not None, an exception is raised if there are fewer than this many sources found
-    :return:
+    Args:
+        incat (str): Input source catalogue to cross-match with. Should be for fits image supplied to de-warp. 
+        refcat (str): Reference source catalogue whose positions are considered correct. 
+        ra1 (str, optional): RA column of source in the incat table. Defaults to "ra".
+        dec1 (str, optional): Dec column of source in the incat table. Defaults to "dec".
+        ra2 (str, optional): RA column of sources in the refcat table. Defaults to "RAJ2000".
+        dec2 (str, optional): Dec column of source in the refcat table. Defaults to "DEJ2000".
+        radius (float, optional): Cross matching radius to use between catalogues. Defaults to 2/60.0.
+        enforce_min_srcs (Optional[int], optional): The minimum number of cross-matched sources that have to be present. Below this the match is considered bad. Defaults to None.
+
+    Raises:
+        ValueError: Thrown when the number of cross-matched sources is below enfore_min_srcs
+
+    Returns:
+        tuple[Table, Table]: The incat table with corrected RA/Dec positions (based on warped screen) and the cross-matched sources used to derive warped screen
     """
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=AstropyWarning)
         # check for incat/refcat as as strings, and load the file if it is
@@ -527,6 +589,7 @@ def warped_xmatch(
     tcat_corrected = tcat_offset.transform_to(target_cat)
     incat[ra1] = tcat_corrected.ra.degree
     incat[dec1] = tcat_corrected.dec.degree
+    
     return incat, xmatch
 
 
@@ -592,7 +655,8 @@ if __name__ == "__main__":
         help="Plot the offsets and models (default = False)",
     )
     group3.add_argument(
-        "-c", "--cores",
+        "-c",
+        "--cores",
         default=1,
         type=int,
         help="Number of cores to instruct dask to use throughout processing",
