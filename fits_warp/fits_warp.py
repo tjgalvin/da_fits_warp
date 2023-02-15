@@ -29,13 +29,12 @@ Other formats can be found here: http://adsabs.harvard.edu/abs/2018A%26C....25..
 import argparse
 import glob
 import logging
-import multiprocessing
-import os
 import sys
 import warnings
 from pathlib import Path
 from time import sleep, time
 from typing import Any, Optional, Union
+from collections import namedtuple
 
 import astropy.units as u
 import dask.array as da
@@ -61,11 +60,15 @@ logger.setLevel(logging.INFO)
 
 Array = Union[da.array, np.array]
 
+OffsetModel = namedtuple("OffsetModel", ("dx", "dy"))
+
+
 def make_source_plot(
     fname: Path,
     hdr: dict[str, Any],
     cat_xy: np.ndarray,
     diff_xy: np.ndarray,
+    offset_models: OffsetModel,
     cmap: str = "hsv",
 ) -> None:
     xmin, xmax = 0, hdr["NAXIS1"]
@@ -74,8 +77,8 @@ def make_source_plot(
     gx, gy = np.mgrid[
         xmin : xmax : (xmax - xmin) / 50.0, ymin : ymax : (ymax - ymin) / 50.0
     ]
-    mdx = offset_x_model(np.ravel(gx), np.ravel(gy))
-    mdy = offset_y_model(np.ravel(gx), np.ravel(gy))
+    mdx = offset_models.dx(np.ravel(gx), np.ravel(gy))
+    mdy = offset_models.dy(np.ravel(gx), np.ravel(gy))
     x = cat_xy[:, 0]
     y = cat_xy[:, 1]
 
@@ -146,7 +149,10 @@ def make_source_plot(
 
     fig.savefig(outname, dpi=200)
 
-def create_divergence_map(fnames: list[Path], xy: Array, x: Array, y: Array, nx: int, ny: int) -> None:
+
+def create_divergence_map(
+    fnames: list[Path], xy: Array, x: Array, y: Array, nx: int, ny: int
+) -> None:
     logger.info("Creating divergence maps")
     start = time()
     # Save the divergence as a fits image
@@ -178,23 +184,7 @@ def make_pix_models(
     noisecol: Optional[str] = None,
     SNR: float = 10,
     max_sources: Optional[int] = None,
-):
-    """
-    Read a fits file which contains the crossmatching results for two catalogues.
-    Catalogue 1 is the source catalogue (positions that need to be corrected)
-    Catalogue 2 is the reference catalogue (correct positions)
-    return rbf models for the ra/dec corrections
-    :param fname: filename for the crossmatched catalogue
-    :param ra1: column name for the ra degrees in catalogue 1 (source)
-    :param dec1: column name for the dec degrees in catalogue 1 (source)
-    :param ra2: column name for the ra degrees in catalogue 2 (reference)
-    :param dec2: column name for the dec degrees in catalogue 2 (reference)
-    :param fitsname: fitsimage upon which the pixel models will be based
-    :param plots: True = Make plots
-    :param smooth: smoothing radius (in pixels) for the RBF function
-    :param max_sources: Maximum number of sources to include in the construction of the warping model (defaults to None, use all sources)
-    :return: (offset_x_model, offset_y_model)
-    """
+) -> OffsetModel:
     file_extension = fname.suffix
     logger.debug(f"File extension of {fname} is {file_extension}.")
 
@@ -259,20 +249,22 @@ def make_pix_models(
 
     diff_xy = ref_xy - cat_xy
     logger.debug(f"Formed diff_xy array: {diff_xy.shape}")
-    
-    global offset_x_model
+
     offset_x_model = interpolate.Rbf(
         cat_xy[:, 0], cat_xy[:, 1], diff_xy[:, 0], function="linear", smooth=smooth
     )
-    global offset_y_model
     offset_y_model = interpolate.Rbf(
         cat_xy[:, 0], cat_xy[:, 1], diff_xy[:, 1], function="linear", smooth=smooth
     )
 
+    offset_models = OffsetModel(dx=offset_x_model, dy=offset_y_model)
+
     logger.info(f"Model created in {time() - start} seconds.")
 
     if plots:
-        make_source_plot(fname, hdr, cat_xy, diff_xy)
+        make_source_plot(fname, hdr, cat_xy, diff_xy, offset_models)
+
+    return offset_models
 
 
 def apply_interp(index, x1, y1, x2, y2, data):
@@ -284,32 +276,21 @@ def apply_interp(index, x1, y1, x2, y2, data):
     return index, newdata
 
 
-def derive_apply_Clough(offset_x: Array, offset_y: Array, data: Array,
-                        reference_x: Array, reference_y: Array) -> Array:
-    offset_xy = np.array([
-        offset_y, offset_x]
-    )
-    
-    # there must be a meta keyword to set the return type
-    if data.shape[0] == 0:
-        logger.info("I be returning a 0")
-        return np.zeros_like(data)
-    
-    model = CloughTocher2DInterpolator(
-            offset_xy.T,
-            data
-    )
-    
-    return model(
-        np.array(
-            [reference_y,
-            reference_x]
-        ).T
-    )
-    
-    
+def derive_apply_Clough(
+    offset_x: Array,
+    offset_y: Array,
+    data: Array,
+    reference_x: Array,
+    reference_y: Array,
+) -> Array:
+    offset_xy = np.array([offset_y, offset_x])
 
-def correct_images(fnames, suffix, testimage=False, progress=False):
+    model = CloughTocher2DInterpolator(offset_xy.T, data)
+
+    return model(np.array([reference_y, reference_x]).T)
+
+
+def correct_images(offset_models, fnames, suffix, testimage=False, overlap_factor: float=1.):
     """
     Read a list of fits image, and apply pixel-by-pixel corrections based on the
     given x/y models, which are global variables defined earlier.
@@ -326,172 +307,100 @@ def correct_images(fnames, suffix, testimage=False, progress=False):
     ny = hdr["NAXIS2"]
 
     xy = da.indices((ny, nx), dtype=np.float32, chunks=(500, 500))
-    
+
     logger.debug(f"{xy.shape=}, type: {type(xy)}")
-    
+
     logger.info(xy)
 
-    delta_x = da.blockwise(
-        offset_x_model,
-        'jk', 
-        xy[1,:,:],
-        'jk',
-        xy[0,:,:],
-        'jk',
-        dtype=np.float32
+    delta_x = da.map_blocks(
+        offset_models.dx, xy[1, :, :], xy[0, :, :], dtype=np.float32
     )
 
-    logger.info(delta_x)
-    
-    delta_y = da.blockwise(
-        offset_y_model,
-        'jk', 
-        xy[1,:,:],
-        'jk',
-        xy[0,:,:],
-        'jk',
-        dtype=np.float32
+    delta_y = da.map_blocks(
+        offset_models.dy, xy[1, :, :], xy[0, :, :], dtype=np.float32
     )
-    
-    logger.info(delta_y)
-    
+
     logger.info(f"Computing new x-coordinates")
-    x = xy[1, :, :] + delta_x.compute()
-    
+    x = xy[1, :, :] + delta_x
+    x = x.compute()
+
     logger.info(f"Computing new y-coordinates")
-    y = xy[0, :, :] + delta_y.compute()
-    
-    fig, ax1 = plt.subplots(1,1)
-    
-    cim = ax1.imshow(
-        x
-    )
-    fig.colorbar(cim)
-    fig.tight_layout()
-    fig.savefig('example_x.pdf')
-    
-    fig, ax1 = plt.subplots(1,1)
-    
-    cim = ax1.imshow(
-        y
-    )
-    fig.colorbar(cim)
-    fig.tight_layout()
-    fig.savefig('example_y.pdf')
-    
+    y = xy[0, :, :] + delta_y
+    y = y.compute()
+
     if testimage is True:
         create_divergence_map(fnames, xy, x, y, nx, ny)
-    
-    # return
-    
+
+    offset_x = da.reshape(da.asarray(x), (-1,))
+    offset_y = da.reshape(da.asarray(y), (-1,))
+
     for fname in fnames:
         fout = fname.replace(".fits", "_" + suffix + ".fits")
         im = fits.open(fname)
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
-        oldshape = im[0].data.shape
+
         data = im[0].data
+        overlap_depth = int(data.shape[-1] * overlap_factor)
+        logger.info(f"Overlapping fastest moving axis with {overlap_factor=}, setting {overlap_depth=}")
         finite_mask = np.isfinite(data)
         data[~finite_mask] = 0.0
+
         data = da.array(data)
-        
         data = da.squeeze(data)
-        squeezedshape = data.shape
-        
-        # Replace NaNs with zeroes because otherwise it breaks the interpolation
-        nandices = da.isnan(data)
-        
+
         logger.info(f"interpolating {fname}")
         logger.debug(f"data shape {data.shape=}")
-        logger.info(f"{data}")
-    
-        logger.debug(f"Rechunking positions")
-        t_xy = da.reshape(
-            da.transpose(
-                da.array([x,y])
-            ),
-            (-1, 2)
-        )
-        offset_x = da.reshape(
-            da.asarray(x),
-            (-1,)
-        )
-        offset_y = da.reshape(
-            da.asarray(y),
-            (-1,)
-        )
         
-        logger.debug(f"Transpose xy: {t_xy.shape=}")
-        logger.debug(f"{t_xy}")
         
         logger.debug(f"Rechunking ravel data")
-        ravel_data = da.rechunk(
-            np.ravel(data),
-            chunks='auto'
-        )
+        ravel_data = da.rechunk(np.ravel(data), chunks="auto")
         logger.debug(f"{ravel_data=}")
-        
-        logger.info("all at once")
-        logger.info(f"{xy=}")
-        
-        reference_x = da.reshape(
-            xy[1,:,:],
-            (-1, )
-        )
 
-        reference_y = da.reshape(
-            xy[0,:,:],
-            (-1, )
-        )
+        logger.info("all at once")
+
+        reference_x = da.reshape(xy[1, :, :], (-1,))
+        reference_y = da.reshape(xy[0, :, :], (-1,))
 
         logger.info(f"{offset_x=}")
         logger.info(f"{offset_y=}")
         logger.info(f"{ravel_data=}")
         logger.info(f"{reference_x=}")
         logger.info(f"{reference_y=}")
-        
-        models = da.map_overlap(
+
+        warped_data = da.map_overlap(
             derive_apply_Clough,
-            offset_x, 
+            offset_x,
             offset_y,
-            ravel_data, 
-            reference_x, 
+            ravel_data,
+            reference_x,
             reference_y,
             dtype=np.float32,
             align_arrays=True,
             allow_rechunk=True,
-            depth=50,
-            boundary='nearest'          
+            depth=overlap_depth,
+            trim=True,
+            boundary="nearest",
+            meta=np.array(()),
         )
-        
-        logger.info(f"{models}")
-        logger.info(f"About to recompute")
-        newdata = models.compute()
-        
-        logger.info(f"Compute finished: {newdata}")
-        
+
+        logger.info(f"{warped_data}")
+        logger.info(f"Dewarping image...")
+        warped_data = warped_data.compute()
+
+        logger.info(f"Dewarp finished!")
+
         # Float32 instead of Float64 since the precision is meaningless
-        logger.info("int64 -> int32")
-        data = newdata.astype(np.float32)
-    
-        data = newdata.reshape(squeezedshape)
-        logger.info(f"{data=}")
+        data = warped_data.astype(np.float32)
+
+        warped_data = warped_data.reshape(im[0].data.shape)
+        warped_data[~finite_mask] = np.nan
         
-        # NaN the edges by 10 pixels to avoid weird edge effects
-        logger.info("blanking edges")
-        data[0:10, :] = np.nan
-        data[:, 0:10] = np.nan
-        data[:, -10 : data.shape[0]] = np.nan
-        data[-10 : data.shape[1], :] = np.nan
-        
-        # Re-apply any previous NaN mask to the data
-        data = data.reshape(oldshape)
-        data[~finite_mask] = np.nan
-        im[0].data = data
-        
+        im[0].data = warped_data
+
         logger.info("saving...")
         im.writeto(fout, overwrite=True, output_verify="fix+warn")
-        logger.info("wrote {0}".format(fout))
-        
+        logger.info(f"wrote {fout}")
+
     return
 
 
@@ -752,7 +661,8 @@ if __name__ == "__main__":
         help="Provide a progress bar for stages that are distributed into work-units",
     )
     group3.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         default=False,
         action="store_true",
         help="Provide extra logging throughout the procedure",
@@ -805,9 +715,7 @@ if __name__ == "__main__":
         logger.setLevel(logging.DEBUG)
 
     if results.cite is True:
-        logger.info(
-            __doc__
-        )
+        logger.info(__doc__)
         sys.exit()
 
     if results.incat is not None:
@@ -834,11 +742,16 @@ if __name__ == "__main__":
 
     if results.infits is not None:
         if results.xm is not None:
-            cluster = LocalCluster(n_workers=8, threads_per_worker=1)  # Launches a scheduler and workers locally
-            with Client(cluster) as client:  # Connect to distributed cluster and override default
+            cluster = LocalCluster(
+                n_workers=8, threads_per_worker=1
+            )  # Launches a scheduler and workers locally
+
+            with Client(
+                cluster
+            ) as client:  # Connect to distributed cluster and override default
                 fnames = glob.glob(results.infits)
                 # Use the first image to define the model
-                make_pix_models(
+                offset_models = make_pix_models(
                     results.xm,
                     results.ra1,
                     results.dec1,
@@ -854,10 +767,10 @@ if __name__ == "__main__":
                 )
                 if results.suffix is not None:
                     correct_images(
+                        offset_models,
                         fnames,
                         results.suffix,
                         results.testimage,
-                        progress=results.progress,
                     )
                 else:
                     logger.info(
