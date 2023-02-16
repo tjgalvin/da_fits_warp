@@ -374,7 +374,7 @@ def correct_images(
     y = xy[0, :, :] + delta_y
     offset_y = da.reshape(y, (-1,))
 
-    if testimage is True:
+    if testimage:
         logger.info(f"Creating divergence map.")
         logger.info(f"Evaluating x- and y-coordinates for divergence map.")
         create_divergence_map(fnames, xy, x.compute(), y.compute(), nx, ny)
@@ -767,7 +767,7 @@ def cli():
     if results.verbose:
         logger.setLevel(logging.DEBUG)
 
-    if results.cite is True:
+    if results.cite:
         logger.info(__doc__)
         sys.exit()
 
