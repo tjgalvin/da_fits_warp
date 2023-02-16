@@ -12,8 +12,11 @@ python = "^3.8"
 numpy = "^1.23.0"
 astropy = "^5.2.1"
 scipy = "^1.9.0"
-dask = "^2023.2.0"
+dask = {extras = ["distributed"], version = "^2023.2.0"}
 matplotlib = "^3.7.0"
+
+[tool.poetry.scripts]
+da_fits_warp = 'da_fits_warp.da_fits_warp:cli'
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.1.0"
@@ -22,6 +25,3 @@ mypy = "^1.0.0"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
-
-[tools.poetry.scripts]
-da_fits_warp = 'da_fits_warp.da_fits_warp:cli'

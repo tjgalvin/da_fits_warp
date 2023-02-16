@@ -755,7 +755,7 @@ def cli():
         dest="cite",
         default=False,
         action="store_true",
-        help="logger.info citation in BibTeX format.",
+        help="Print citation in BibTeX format.",
     )
 
     results = parser.parse_args()
