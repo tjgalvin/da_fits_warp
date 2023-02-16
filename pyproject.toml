@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "da-fits-warp"
-version = "2.1.0"
+version = "2.1.2"
 description = "Warp catalogues and images to remove the distorting affect of the ionosphere."
 authors = ["Natasha Hurley-Walker, Paul Hancock, Tim Galvin"]
 license = "Academic Free License v3.0"
