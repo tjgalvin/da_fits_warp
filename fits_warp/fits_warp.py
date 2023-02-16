@@ -48,10 +48,9 @@ from astropy.stats.circstats import circmean
 from astropy.table import Table, hstack
 from astropy.utils.exceptions import AstropyWarning
 from dask.distributed import Client, LocalCluster
-from matplotlib import gridspec, pyplot
+from matplotlib import gridspec
 from scipy import interpolate
 from scipy.interpolate import CloughTocher2DInterpolator
-from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(module)s:%(levelname)s:%(lineno)d %(message)s")
@@ -796,6 +795,7 @@ if __name__ == "__main__":
 
     if results.infits is not None:
         if results.xm is not None:
+            logger.info(f"Using {results.cores} throughout computation. ")
             cluster = LocalCluster(
                 n_workers=results.cores, threads_per_worker=1
             )  # Launches a scheduler and workers locally
