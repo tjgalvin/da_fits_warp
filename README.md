@@ -58,4 +58,4 @@ Please use the GitHub issue tracker to submit bug reports, feature requests, or 
 ## Credit
 If you use fits_warp in your work please Cite [Hurley-Walker and Hancock 2018](http://adsabs.harvard.edu/abs/2018A%26C....25...94H).
 
-This `da_fits_warp` is an update to the original `fits_warp` implementation, with the most major change being the use of `dask` to handle parallelism. 
+This `da_fits_warp` is an update to the original [`fits_warp`](https://github.com/nhurleywalker/fits_warp) implementation, with the most major change being the use of `dask` to handle parallelism. 
