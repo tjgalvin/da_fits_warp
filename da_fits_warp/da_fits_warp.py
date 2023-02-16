@@ -592,7 +592,7 @@ def warped_xmatch(
     return incat, xmatch
 
 
-if __name__ == "__main__":
+def cli():
     parser = argparse.ArgumentParser()
     group1 = parser.add_argument_group("Warping input/output files")
     group1.add_argument(
@@ -835,3 +835,7 @@ if __name__ == "__main__":
             logger.info(
                 "Must specify a cross-matched catalogue via --xm to perform the warping."
             )
+
+
+if __name__ == "__main__":
+    cli()

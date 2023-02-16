@@ -1,11 +1,11 @@
 [tool.poetry]
-name = "fits-warp"
+name = "da-fits-warp"
 version = "2.1.0"
 description = "Warp catalogues and images to remove the distorting affect of the ionosphere."
 authors = ["Natasha Hurley-Walker, Paul Hancock, Tim Galvin"]
 license = "Academic Free License v3.0"
 readme = "README.md"
-packages = [{include = "fits_warp"}]
+packages = [{include = "da_fits_warp"}]
 
 [tool.poetry.dependencies]
 python = "^3.8"
@@ -22,3 +22,6 @@ mypy = "^1.0.0"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tools.poetry.scripts]
+da_fits_warp = 'da_fits_warp.da_fits_warp:cli'

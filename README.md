@@ -1,5 +1,5 @@
-# fits_warp
-Aim: Warp catalogues and images to remove the distorting affect of the ionosphere.
+# da_fits_warp
+Aim: Warp catalogues and images to remove the distorting affect of the ionosphere. This version uses Dask arrays to handle code parallelisation. 
 
 Authors: Natasha Hurley-Walker and Paul Hancock
 
