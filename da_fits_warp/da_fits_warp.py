@@ -69,7 +69,7 @@ def make_source_plot(
     offset_models: OffsetModel,
     cmap: str = "hsv",
 ) -> None:
-    """Create a figure showing the cross-matched sources and their offsets, as 
+    """Create a figure showing the cross-matched sources and their offsets, as
     well as the interpolated screen of offsets
 
     Args:
@@ -162,12 +162,12 @@ def make_source_plot(
 def create_divergence_map(
     fnames: list[Path], xy: Array, x: Array, y: Array, nx: int, ny: int
 ) -> None:
-    """Generate a divergence map of source offsets. This (appears) to be the 
-    sum of the gradients of offsets in both X and Y directions. 
+    """Generate a divergence map of source offsets. This (appears) to be the
+    sum of the gradients of offsets in both X and Y directions.
 
     Args:
-        fnames (list[Path]): Collection of fits images. The header of the first is used to generate the map. 
-        xy (Array): Pixel positions of sources in x and y. 
+        fnames (list[Path]): Collection of fits images. The header of the first is used to generate the map.
+        xy (Array): Pixel positions of sources in x and y.
         x (Array): Offset source positions in x direction
         y (Array): Offset source positions in y direction
         nx (int): Number of x pixels to reshape to
@@ -209,7 +209,7 @@ def make_pix_models(
     to shift positions by to effectively 'dewarp.;
 
     Args:
-        fname (Path): Name of the crossed matched source table 
+        fname (Path): Name of the crossed matched source table
         ra1 (str, optional): RA column of input catalogue 1. Defaults to "ra".
         dec1 (str, optional): Dec column of input catalogue 1. Defaults to "dec".
         ra2 (str, optional): RA column of reference catalogue. Defaults to "RAJ2000".
@@ -226,7 +226,7 @@ def make_pix_models(
         ValueError: Issued when table of sources can not be opened
 
     Returns:
-        OffsetModel: Pair of RBF interpolator models for x and y directions. 
+        OffsetModel: Pair of RBF interpolator models for x and y directions.
     """
     file_extension = fname.suffix
     logger.debug(f"File extension of {fname} is {file_extension}.")
@@ -318,7 +318,7 @@ def derive_apply_Clough(
     reference_y: Array,
 ) -> Array:
     """Create and evaluate a CloughTocher2DInterpolator function to shift image
-    pixels with. All inputs need to be the same length. 
+    pixels with. All inputs need to be the same length.
 
     Args:
         offset_x (Array): The offset pixel x-coordinate frame (i.e. true + warped offsets)
@@ -338,7 +338,12 @@ def derive_apply_Clough(
 
 
 def correct_images(
-    offset_models: OffsetModel, fnames: list[str], suffix: str, testimage: bool=False, overlap_factor: float = 2.
+    offset_models: OffsetModel,
+    fnames: list[str],
+    suffix: str,
+    testimage: bool = False,
+    overlap_factor: float = 2.0,
+    chunk_row_size: float = 50
 ):
     """Given RBF-interpolator models and target images, dewarp them to remove positional
     shifts of sources
@@ -349,6 +354,7 @@ def correct_images(
         suffix (str): String attached to the end of the file name (before extension)
         testimage (bool, optional): Whether to create a divergence map. Defaults to False.
         overlap_factor (float, optional): Factor to determine number of pixels for the interpolator to share between adjacent blocks. Factor is multiplied against the length of the fastest moving axis. Too low and artefacts will be introduced. Defaults to 1.0.
+        chunk_row_size (float, optional): The number of rows of pixels to chunk dask arrays to. Larger numbers improve performance at cost of memory, which can lead to instabilities. Defaults to 50.
     """
     # Get co-ordinate system from first image
     # Do not open images at this stage, to save memory
@@ -356,7 +362,7 @@ def correct_images(
     nx = hdr["NAXIS1"]
     ny = hdr["NAXIS2"]
 
-    xy = da.indices((ny, nx), dtype=np.float32, chunks=(500, 500))
+    xy = da.indices((ny, nx), dtype=np.float32, chunks=(chunk_row_size, nx))
 
     logger.debug(f"{xy.shape=}, type: {type(xy)}")
 
@@ -368,11 +374,14 @@ def correct_images(
         offset_models.dy, xy[1, :, :], xy[0, :, :], dtype=np.float32
     )
 
+    new_chunk_size = int(nx * chunk_row_size)
+    logger.info(f"Rechunking to {chunk_row_size} * {nx} pixe;s, total chunk {new_chunk_size}")
+
     x = xy[1, :, :] + delta_x
-    offset_x = da.reshape(x, (-1,))
+    offset_x = da.rechunk(da.reshape(x, (-1,)), chunks=new_chunk_size)
 
     y = xy[0, :, :] + delta_y
-    offset_y = da.reshape(y, (-1,))
+    offset_y = da.rechunk(da.reshape(y, (-1,)), chunks=new_chunk_size)
 
     if testimage:
         logger.info(f"Creating divergence map.")
@@ -396,8 +405,8 @@ def correct_images(
 
         data = da.squeeze(da.array(data))
         ravel_data = da.ravel(data)
-        reference_x = da.reshape(xy[1, :, :], (-1,))
-        reference_y = da.reshape(xy[0, :, :], (-1,))
+        reference_x = da.rechunk(da.reshape(xy[1, :, :], (-1,)), chunks=new_chunk_size)
+        reference_y = da.rechunk(da.reshape(xy[0, :, :], (-1,)), chunks=new_chunk_size)
 
         logger.debug(f"{offset_x=}")
         logger.debug(f"{offset_y=}")
@@ -417,7 +426,7 @@ def correct_images(
             reference_y,
             dtype=np.float32,
             align_arrays=True,
-            allow_rechunk=True,
+            # allow_rechunk=True,
             depth=overlap_depth,
             # trim=True,
             boundary="nearest",
@@ -445,20 +454,20 @@ def correct_images(
 def warped_xmatch(
     incat: str,
     refcat: str,
-    ra1: str="ra",
-    dec1: str="dec",
-    ra2: str="RAJ2000",
-    dec2: str="DEJ2000",
-    radius: float=2 / 60.0,
-    enforce_min_srcs: Optional[int]=None,
+    ra1: str = "ra",
+    dec1: str = "dec",
+    ra2: str = "RAJ2000",
+    dec2: str = "DEJ2000",
+    radius: float = 2 / 60.0,
+    enforce_min_srcs: Optional[int] = None,
 ) -> tuple[Table, Table]:
-    """Given two source catalogues, perform an iterative serch to cross-match sources. 
+    """Given two source catalogues, perform an iterative serch to cross-match sources.
     Successive rounds of cross-matching will refine an initial warp screen, which will
-    improve the reliability of the cross match. 
+    improve the reliability of the cross match.
 
     Args:
-        incat (str): Input source catalogue to cross-match with. Should be for fits image supplied to de-warp. 
-        refcat (str): Reference source catalogue whose positions are considered correct. 
+        incat (str): Input source catalogue to cross-match with. Should be for fits image supplied to de-warp.
+        refcat (str): Reference source catalogue whose positions are considered correct.
         ra1 (str, optional): RA column of source in the incat table. Defaults to "ra".
         dec1 (str, optional): Dec column of source in the incat table. Defaults to "dec".
         ra2 (str, optional): RA column of sources in the refcat table. Defaults to "RAJ2000".
@@ -588,7 +597,7 @@ def warped_xmatch(
     tcat_corrected = tcat_offset.transform_to(target_cat)
     incat[ra1] = tcat_corrected.ra.degree
     incat[dec1] = tcat_corrected.dec.degree
-    
+
     return incat, xmatch
 
 
@@ -661,10 +670,10 @@ def cli():
         help="Number of cores to instruct dask to use throughout processing",
     )
     group3.add_argument(
-        '--overlap-factor',
+        "--overlap-factor",
         type=float,
         default=2,
-        help="Factor mulptipled against size of fastest moving image axis to determine the number of pixels from neighbouring sub-blocks to include in image interpolation. To small and artefacts can be introduced. "
+        help="Factor mulptipled against size of fastest moving image axis to determine the number of pixels from neighbouring sub-blocks to include in image interpolation. To small and artefacts can be introduced. ",
     )
     group3.add_argument(
         "--testimage",
@@ -825,7 +834,7 @@ def cli():
                         fnames,
                         results.suffix,
                         results.testimage,
-                        overlap_factor=results.overlap_factor
+                        overlap_factor=results.overlap_factor,
                     )
                 else:
                     logger.info(
